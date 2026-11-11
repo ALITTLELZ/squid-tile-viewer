@@ -70,3 +70,6 @@ Language follows the system language; change it at the bottom of the panel (appl
   flat-field corrected and blended in tile overlaps, so for strict intensity measurements
   go back to the raw tiles in `ome_tiff/`.
 - Tested on macOS (Apple Silicon) with napari 0.10. Windows launcher not yet tested.
+
+## License
+MIT, see [LICENSE](LICENSE).

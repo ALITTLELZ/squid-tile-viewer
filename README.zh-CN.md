@@ -55,3 +55,6 @@
 ## 说明
 - 拼接后的数据经过了平场校正，tile 重叠区也做了融合。严格的定量请回到 `ome_tiff/` 里的原始 tile。
 - 只在 macOS（Apple Silicon）上测试过。Windows 启动器还没有实测。
+
+## 许可证
+MIT 许可证，详见 [LICENSE](LICENSE)。
