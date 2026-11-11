@@ -846,19 +846,21 @@ def run_viewer(folder: str | None):
 
     cb_lang.currentIndexChanged.connect(on_lang)
 
+    def mip_data(c):
+        # Broadcast the MIP to the same (Z, Y, X) shape as the z-stack (no extra memory),
+        # so swapping layer data never changes its shape. Changing shape made napari draw
+        # one frame with stale tile coordinates -> empty texture -> OpenGL error.
+        return [np.broadcast_to(m[c][None], (acq.nz,) + m.shape[-2:]) for m in mips]
+
     def set_mip(on):
         if on == state["mip"]:
             return
-        if on:
-            state["z"] = viewer.dims.current_step[0]
         for c, l in enumerate(ch_layers):
             cl, cr = l.contrast_limits, l.contrast_limits_range
-            l.data = [m[c][None] for m in mips] if on else [lv[:, c] for lv in levels]
+            l.data = mip_data(c) if on else [lv[:, c] for lv in levels]
             l.contrast_limits_range = cr
             l.contrast_limits = cl
         state["mip"] = on
-        if not on:
-            viewer.dims.set_current_step(0, state["z"])
 
     cb_mip.toggled.connect(set_mip)
 
