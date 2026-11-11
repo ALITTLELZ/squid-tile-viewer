@@ -12,6 +12,8 @@ adjust channel colors/contrast, and export composite images of fixed- or free-si
   dark tile borders (vignetting).
 - Shows every channel as its own layer in [napari](https://napari.org): color, contrast,
   gamma and visibility per channel; z-slider or maximum-intensity projection (MIP).
+- Flips and 90° rotations, so every section can be shown (and exported) in the same orientation.
+- Remembers your display settings per folder (contrast, colors, orientation, ROIs, ...).
 - Exports, into `<acquisition>/exports/`:
   - **ROIs** at full resolution: fixed-size boxes (enter width × height in µm or pixels,
     drag to position; the size stays locked) or free rectangles.
@@ -53,10 +55,20 @@ uv run --python 3.12 tile_viewer.py ACQ_FOLDER --overview   # just export a stit
    *contrast limits* (brightness), *gamma*, *colormap*, *opacity*. The eye icon toggles a channel.
    Panel buttons: *Auto contrast (current view)* and *Reset contrast*.
 3. **z / MIP:** use the slider under the image, or tick *Max intensity projection*.
-4. **Fixed-size ROI:** enter W and H, choose µm or pixels, click *Add fixed-size box*.
+4. **Orientation:** *Flip horizontal / vertical*, *Rotate 90° left / right*, *Reset orientation*.
+   ROIs move with the image; exports (PNG, TIFF, scale bar) come out in the orientation you see, and the
+   file name records it (e.g. `_flipH-rot90cw`). Nothing is copied: it's only a different view of the data.
+5. **Fixed-size ROI:** enter W and H, choose µm or pixels, click *Add fixed-size box*.
    Drag inside the box to move it. Add as many as you like; select one and press Delete to remove it.
-5. Click *Export ROIs* → files appear in `exports/` (button *Open export folder*).
+6. Click *Export ROIs* → files appear in `exports/` (button *Open export folder*).
    Exports use exactly the colors/contrast you see. Untick channels you don't want in the composite.
+
+**Saved settings.** When you close the window (and after every export), the viewer saves the
+per-channel contrast/gamma/colormap/opacity/visibility, MIP on/off, z-plane, orientation, view
+position, ROIs and export options to `<acquisition>/tile_viewer_settings.json`, and restores them
+the next time you open that folder. A folder you have never opened before gets the last colors and
+contrast you used for channels with the same names, so similar samples look consistent.
+Delete the JSON file to start fresh.
 
 Language follows the system language; change it at the bottom of the panel (applies on restart).
 

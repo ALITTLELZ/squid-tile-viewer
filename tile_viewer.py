@@ -110,7 +110,25 @@ STRINGS = {
             "contrast limits, gamma, colormap, opacity. Click the eye icon to show/hide a channel."),
     "lang_label": ("界面语言（重启生效）", "Language (applies on restart)"),
     "lang_saved": ("语言已保存，下次启动生效", "Language saved; it applies next time you start the viewer"),
+    "grp_orient": ("方向（翻转 / 旋转）", "Orientation (flip / rotate)"),
+    "flip_h": ("水平翻转 ⇆", "Flip horizontal ⇆"),
+    "flip_v": ("垂直翻转 ⇅", "Flip vertical ⇅"),
+    "rot_l": ("向左旋转 90° ⟲", "Rotate 90° left ⟲"),
+    "rot_r": ("向右旋转 90° ⟳", "Rotate 90° right ⟳"),
+    "orient_reset": ("恢复原始方向", "Reset orientation"),
+    "orient_cur": ("当前：", "Current: "),
+    "orient_none": ("原始方向", "original"),
+    "d_flip": ("水平翻转", "flipped horizontally"),
+    "d_rot1": ("逆时针旋转 90°", "rotated 90° counter-clockwise"),
+    "d_rot2": ("旋转 180°", "rotated 180°"),
+    "d_rot3": ("顺时针旋转 90°", "rotated 90° clockwise"),
+    "autosave_note": ("对比度、颜色、方向、选框等显示设置会在关闭窗口（和每次导出）时自动保存，"
+                      "下次打开同一文件夹自动恢复。",
+                      "Display settings (contrast, colors, orientation, ROIs, ...) are saved automatically when "
+                      "you close the window (and on every export) and restored next time you open this folder."),
     # notifications
+    "n_restored": ("已恢复上次的显示设置", "Restored your last display settings for this folder"),
+    "n_defaults": ("已沿用上次相同通道的颜色和对比度", "Applied your last color/contrast settings for these channels"),
     "n_auto": ("已按当前画面自动调整对比度", "Contrast adjusted to the current view"),
     "n_empty": ("选区为空或在图像外", "ROI is empty or outside the image"),
     "n_no_roi": ("还没有选区：先添加固定大小选框，或点「开始画矩形选区」在图上拖出一个框",
@@ -733,8 +751,22 @@ def run_viewer(folder: str | None):
     viewer.dims.set_current_step(0, acq.nz // 2)
     viewer.layers.selection.active = ch_layers[0]
 
-    state = {"mip": False, "z": acq.nz // 2}
+    # flip/k: displayed image = rot90(fliplr?(data), k)  (k = counter-clockwise quarter turns)
+    state = {"mip": False, "flip": False, "k": 0}
     out_dir = acq.folder / "exports"
+    settings_file = acq.folder / "tile_viewer_settings.json"
+
+    def orient(a):
+        """Apply the current flip/rotation to the last two axes (returns a view, no copy)."""
+        if state["flip"]:
+            a = np.flip(a, -1)
+        if state["k"]:
+            a = np.rot90(a, state["k"], axes=(-2, -1))
+        return a
+
+    def cur_hw():
+        h, w = levels[0].shape[-2:]
+        return (w, h) if state["k"] % 2 else (h, w)
 
     # ---------------- panel ----------------
     w = QWidget()
@@ -755,6 +787,25 @@ def run_viewer(folder: str | None):
     bt_reset = QPushButton(tr("reset"))
     v1.addWidget(bt_reset)
     lay_v.addWidget(g1)
+
+    go = QGroupBox(tr("grp_orient"))
+    vo = QVBoxLayout(go)
+    ho1, ho2 = QHBoxLayout(), QHBoxLayout()
+    bt_fh, bt_fv = QPushButton(tr("flip_h")), QPushButton(tr("flip_v"))
+    bt_rl, bt_rr = QPushButton(tr("rot_l")), QPushButton(tr("rot_r"))
+    ho1.addWidget(bt_fh)
+    ho1.addWidget(bt_fv)
+    ho2.addWidget(bt_rl)
+    ho2.addWidget(bt_rr)
+    vo.addLayout(ho1)
+    vo.addLayout(ho2)
+    bt_oreset = QPushButton(tr("orient_reset"))
+    vo.addWidget(bt_oreset)
+    lb_orient = QLabel()
+    lb_orient.setWordWrap(True)
+    lb_orient.setStyleSheet("color: gray")
+    vo.addWidget(lb_orient)
+    lay_v.addWidget(go)
 
     g2 = QGroupBox(tr("grp_export"))
     v2 = QVBoxLayout(g2)
@@ -818,6 +869,10 @@ def run_viewer(folder: str | None):
     tip.setWordWrap(True)
     tip.setStyleSheet("color: gray")
     lay_v.addWidget(tip)
+    note = QLabel(tr("autosave_note"))
+    note.setWordWrap(True)
+    note.setStyleSheet("color: gray")
+    lay_v.addWidget(note)
 
     hl = QHBoxLayout()
     hl.addWidget(QLabel(tr("lang_label")))
@@ -827,7 +882,7 @@ def run_viewer(folder: str | None):
     hl.addWidget(cb_lang)
     lay_v.addLayout(hl)
     lay_v.addStretch(1)
-    for g in (g1, g2, gf):
+    for g in (g1, go, g2, gf):
         g.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
     scroll = QScrollArea()
     scroll.setWidgetResizable(True)
@@ -852,15 +907,33 @@ def run_viewer(folder: str | None):
         # one frame with stale tile coordinates -> empty texture -> OpenGL error.
         return [np.broadcast_to(m[c][None], (acq.nz,) + m.shape[-2:]) for m in mips]
 
+    def layer_data(c):
+        src = mip_data(c) if state["mip"] else [lv[:, c] for lv in levels]
+        return [orient(a) for a in src]
+
+    def refresh_layers():
+        """Swap layer data for the current MIP/orientation state, keeping display settings.
+        If the shape changes (90° rotation), hide layers during the swap so napari never
+        draws a frame with stale tile coordinates."""
+        shape_changes = ch_layers[0].data[0].shape != layer_data(0)[0].shape
+        vis = [l.visible for l in ch_layers]
+        if shape_changes:
+            for l in ch_layers:
+                l.visible = False
+        for c, l in enumerate(ch_layers):
+            cl, cr = l.contrast_limits, l.contrast_limits_range
+            l.data = layer_data(c)
+            l.contrast_limits_range = cr
+            l.contrast_limits = cl
+        if shape_changes:
+            for l, v in zip(ch_layers, vis):
+                l.visible = v
+
     def set_mip(on):
         if on == state["mip"]:
             return
-        for c, l in enumerate(ch_layers):
-            cl, cr = l.contrast_limits, l.contrast_limits_range
-            l.data = mip_data(c) if on else [lv[:, c] for lv in levels]
-            l.contrast_limits_range = cr
-            l.contrast_limits = cl
         state["mip"] = on
+        refresh_layers()
 
     cb_mip.toggled.connect(set_mip)
 
@@ -874,9 +947,9 @@ def run_viewer(folder: str | None):
         return out
 
     def plane(c, y0, y1, x0, x1, level=0):
-        if state["mip"]:
-            return np.asarray(mips[level][c, y0:y1, x0:x1])
-        return np.asarray(levels[level][viewer.dims.current_step[0], c, y0:y1, x0:x1])
+        """2D region (in displayed/oriented pixel coordinates) of channel c at the current z or MIP."""
+        src = mips[level][c] if state["mip"] else levels[level][viewer.dims.current_step[0], c]
+        return np.asarray(orient(src)[y0:y1, x0:x1])
 
     def on_auto():
         l0 = ch_layers[0]
@@ -905,10 +978,9 @@ def run_viewer(folder: str | None):
 
     bt_rect.clicked.connect(on_rect)
 
-    H0, W0 = levels[0].shape[-2:]
-
     def fixed_rect(cy, cx, fh, fw):
         """fh x fw px rectangle centred on (cy, cx), shifted to stay inside the image."""
+        H0, W0 = cur_hw()
         fh, fw = min(fh, H0), min(fw, W0)
         y0 = int(round(cy - fh / 2))
         x0 = int(round(cx - fw / 2))
@@ -995,12 +1067,16 @@ def run_viewer(folder: str | None):
 
     def tag():
         z = "MIP" if state["mip"] else f"z{viewer.dims.current_step[0]:02d}"
+        rot_tag = {1: "rot90ccw", 2: "rot180", 3: "rot90cw"}
+        parts = (["flipH"] if state["flip"] else []) + ([rot_tag[state["k"]]] if state["k"] else [])
+        if parts:
+            z += "_" + "-".join(parts)
         return z, _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
 
     def export_region(y0, y1, x0, x1, name):
         from PIL import Image
         out_dir.mkdir(exist_ok=True)
-        H, W = levels[0].shape[-2:]
+        H, W = cur_hw()
         y0, x0 = max(0, y0), max(0, x0)
         y1, x1 = min(H, y1), min(W, x1)
         if y1 - y0 < 2 or x1 - x0 < 2:
@@ -1016,7 +1092,7 @@ def run_viewer(folder: str | None):
         files = [f"{base}.png"]
         if cb_tif.isChecked():
             if cb_stack.isChecked() and not state["mip"]:
-                arr = np.asarray(levels[0][:, :, y0:y1, x0:x1])
+                arr = np.asarray(orient(levels[0])[:, :, y0:y1, x0:x1])
             else:
                 arr = np.stack(chans)[None]
             cols = [l.colormap.map(np.array([1.0]))[0, :3] for l in ch_layers]
@@ -1048,11 +1124,13 @@ def run_viewer(folder: str | None):
             files += export_region(y0, y1, x0, x1, name)
         if files:
             show_info(tr("n_exported", n=len(files), p=out_dir))
+            save_settings()
 
     def on_all():
-        H, W = levels[0].shape[-2:]
+        H, W = cur_hw()
         if export_region(0, H, 0, W, "full"):
             show_info(tr("n_exported_all", p=out_dir))
+            save_settings()
 
     def on_shot():
         out_dir.mkdir(exist_ok=True)
@@ -1070,10 +1148,205 @@ def run_viewer(folder: str | None):
     bt_shot.clicked.connect(on_shot)
     bt_open.clicked.connect(on_open)
 
+    # ---------------- orientation (flip / rotate) ----------------
+    probe = np.arange(6).reshape(2, 3)
+    ops = {"fliph": lambda a: np.flip(a, -1), "flipv": lambda a: np.flip(a, -2),
+           "rotl": lambda a: np.rot90(a, 1), "rotr": lambda a: np.rot90(a, -1)}
+
+    def canon(a):
+        """Express any flip/rotation combination as (flip, k)."""
+        for f in (False, True):
+            for k in range(4):
+                b = np.rot90(np.flip(probe, -1) if f else probe, k)
+                if b.shape == a.shape and np.array_equal(b, a):
+                    return f, k
+        return False, 0
+
+    def map_pts(op, pts, H, W):
+        """Where points (y, x) of the current display land after applying op (H, W = display size)."""
+        y, x = pts[:, 0], pts[:, 1]
+        if op == "fliph":
+            return np.c_[y, W - x]
+        if op == "flipv":
+            return np.c_[H - y, x]
+        if op == "rotl":
+            return np.c_[W - x, y]
+        return np.c_[x, H - y]  # rotr
+
+    def orient_desc():
+        parts = ([tr("d_flip")] if state["flip"] else []) + ([tr(f"d_rot{state['k']}")] if state["k"] else [])
+        return tr("orient_cur") + (" + ".join(parts) if parts else tr("orient_none"))
+
+    def apply_orient_op(op):
+        H, W = cur_hw()
+        cur = np.rot90(np.flip(probe, -1) if state["flip"] else probe, state["k"])
+        state["flip"], state["k"] = canon(ops[op](cur))
+        center = list(viewer.camera.center)
+        zoom = viewer.camera.zoom
+        cyx = np.asarray(center[-2:]) / acq.px_um
+        ny, nx = map_pts(op, cyx[None], H, W)[0]
+        # move the ROIs with the image
+        snapping["on"] = True
+        try:
+            for i, s in enumerate(list(roi.data)):
+                roi._data_view.edit(i, map_pts(op, np.asarray(s)[:, -2:], H, W))
+            if op in ("rotl", "rotr") and len(roi.data):
+                f = roi.features.copy()
+                f["fw"], f["fh"] = f["fh"].to_numpy().copy(), f["fw"].to_numpy().copy()
+                f["label"] = [re.sub(r"^([\d.]+)×([\d.]+)", r"\2×\1", str(s)) for s in f["label"]]
+                roi.features = f
+            roi.refresh()
+            roi.refresh_text()
+        finally:
+            snapping["on"] = False
+        refresh_layers()
+        center[-2:] = [ny * acq.px_um, nx * acq.px_um]
+        viewer.camera.center = tuple(center)
+        viewer.camera.zoom = zoom
+        lb_orient.setText(orient_desc())
+
+    def reset_orient():
+        for _ in range(state["k"]):
+            apply_orient_op("rotr")
+        if state["flip"]:
+            apply_orient_op("fliph")
+
+    bt_fh.clicked.connect(lambda: apply_orient_op("fliph"))
+    bt_fv.clicked.connect(lambda: apply_orient_op("flipv"))
+    bt_rl.clicked.connect(lambda: apply_orient_op("rotl"))
+    bt_rr.clicked.connect(lambda: apply_orient_op("rotr"))
+    bt_oreset.clicked.connect(reset_orient)
+    lb_orient.setText(orient_desc())
+
+    # ---------------- save / restore display settings ----------------
+    def channel_settings(l):
+        cm = l.colormap
+        return dict(contrast_limits=[float(v) for v in l.contrast_limits], gamma=float(l.gamma),
+                    opacity=float(l.opacity), visible=bool(l.visible),
+                    colormap=dict(name=cm.name, colors=np.asarray(cm.colors).tolist(),
+                                  controls=np.asarray(cm.controls).tolist()))
+
+    def collect_settings():
+        f = roi.features
+        rois = [dict(pts=np.asarray(s)[:, -2:].tolist(),
+                     fw=float(f["fw"].iloc[i]) if i < len(f) else 0.0,
+                     fh=float(f["fh"].iloc[i]) if i < len(f) else 0.0,
+                     label=str(f["label"].iloc[i]) if i < len(f) else "")
+                for i, s in enumerate(roi.data)]
+        return dict(version=1, saved=_dt.datetime.now().isoformat(timespec="seconds"),
+                    channels={l.name: channel_settings(l) for l in ch_layers},
+                    mip=state["mip"], z=int(viewer.dims.current_step[0]),
+                    flip=state["flip"], k=state["k"],
+                    camera=dict(center=[float(v) for v in viewer.camera.center], zoom=float(viewer.camera.zoom)),
+                    rois=rois,
+                    export=dict(scale_bar=cb_bar.isChecked(), bar_um=sp_bar.value(),
+                                tif=cb_tif.isChecked(), stack=cb_stack.isChecked()))
+
+    def save_settings():
+        try:
+            s = collect_settings()
+            settings_file.write_text(json.dumps(s, indent=1, ensure_ascii=False), encoding="utf-8")
+            p = load_prefs()
+            p.setdefault("channel_defaults", {}).update(s["channels"])
+            p["export_opts"] = s["export"]
+            save_prefs(p)
+        except Exception as e:  # never block closing the window
+            print("Could not save display settings:", e)
+
+    def apply_channel(l, s):
+        try:
+            cm = s.get("colormap")
+            if cm:
+                l.colormap = Colormap(colors=cm["colors"], controls=cm["controls"], name=cm["name"])
+            cl = s.get("contrast_limits")
+            if cl:
+                lo, hi = l.contrast_limits_range
+                l.contrast_limits_range = (min(lo, cl[0]), max(hi, cl[1]))
+                l.contrast_limits = tuple(cl)
+            for k in ("gamma", "opacity", "visible"):
+                if k in s:
+                    setattr(l, k, s[k])
+        except Exception as e:
+            print(f"Could not restore settings for {l.name}:", e)
+
+    def apply_export_opts(e):
+        cb_bar.setChecked(e.get("scale_bar", True))
+        sp_bar.setValue(int(e.get("bar_um", 0)))
+        cb_tif.setChecked(e.get("tif", True))
+        cb_stack.setChecked(e.get("stack", False))
+
+    def restore_settings():
+        s = None
+        if settings_file.exists():
+            try:
+                s = json.loads(settings_file.read_text(encoding="utf-8"))
+            except Exception as e:
+                print("Could not read saved display settings:", e)
+        if not s:
+            cd = prefs.get("channel_defaults", {})
+            used = [l for l in ch_layers if l.name in cd]
+            for l in used:
+                apply_channel(l, cd[l.name])
+            apply_export_opts(prefs.get("export_opts", {}))
+            if used:
+                show_info(tr("n_defaults"))
+            return
+        state["flip"], state["k"] = bool(s.get("flip", False)), int(s.get("k", 0)) % 4
+        state["mip"] = bool(s.get("mip", False))
+        if state["flip"] or state["k"] or state["mip"]:
+            refresh_layers()
+        cb_mip.blockSignals(True)
+        cb_mip.setChecked(state["mip"])
+        cb_mip.blockSignals(False)
+        lb_orient.setText(orient_desc())
+        for l in ch_layers:
+            if l.name in s.get("channels", {}):
+                apply_channel(l, s["channels"][l.name])
+        if "z" in s:
+            viewer.dims.set_current_step(0, min(max(int(s["z"]), 0), acq.nz - 1))
+        apply_export_opts(s.get("export", {}))
+        for r in s.get("rois", []):
+            roi.feature_defaults = {"fw": r.get("fw", 0.0), "fh": r.get("fh", 0.0), "label": r.get("label", "")}
+            snapping["adding_fixed"] = True
+            try:
+                roi.add_rectangles(np.asarray(r["pts"], float))
+            except Exception as e:
+                print("Could not restore an ROI:", e)
+            finally:
+                snapping["adding_fixed"] = False
+        roi.feature_defaults = {"fw": 0.0, "fh": 0.0, "label": ""}
+        snapping["n"] = len(roi.data)
+        roi.refresh_text()
+        viewer.reset_view()
+        cam = s.get("camera")
+        if cam:
+            try:
+                viewer.camera.center = tuple(cam["center"])
+                viewer.camera.zoom = cam["zoom"]
+            except Exception:
+                pass
+        show_info(tr("n_restored"))
+
+    from qtpy.QtCore import QEvent, QObject
+
+    class _SaveOnClose(QObject):
+        def eventFilter(self, obj, ev):
+            if ev.type() == QEvent.Type.Close:
+                save_settings()
+            return False
+
+    qwin = viewer.window._qt_window
+    saver = _SaveOnClose(qwin)
+    qwin.installEventFilter(saver)
+
     viewer.reset_view()
+    restore_settings()
     viewer._tv = dict(acq=acq, set_mip=set_mip, export_region=export_region, on_auto=on_auto,
                       ch_layers=ch_layers, roi=roi, on_roi=on_roi, on_shot=on_shot,
-                      add_fixed=add_fixed, snap_fixed=snap_fixed, sp_w=sp_w, sp_h=sp_h, cb_unit=cb_unit)
+                      add_fixed=add_fixed, snap_fixed=snap_fixed, sp_w=sp_w, sp_h=sp_h, cb_unit=cb_unit,
+                      apply_orient_op=apply_orient_op, reset_orient=reset_orient, state=state,
+                      save_settings=save_settings, settings_file=settings_file, saver=saver,
+                      plane=plane, cur_hw=cur_hw)
     return viewer
 
 
