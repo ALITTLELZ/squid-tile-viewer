@@ -14,6 +14,8 @@ adjust channel colors/contrast, and export composite images of fixed- or free-si
   gamma and visibility per channel; z-slider or maximum-intensity projection (MIP).
 - Flips and 90° rotations, so every section can be shown (and exported) in the same orientation.
 - Remembers your display settings per folder (contrast, colors, orientation, ROIs, ...).
+- Compare samples at identical display settings: open another acquisition with the current
+  colors/contrast, side by side, optionally linked live; warns when exposure/laser/gain differ.
 - Exports, into `<acquisition>/exports/`:
   - **ROIs** at full resolution: fixed-size boxes (enter width × height in µm or pixels,
     drag to position; the size stays locked) or free rectangles.
@@ -62,6 +64,17 @@ uv run --python 3.12 tile_viewer.py ACQ_FOLDER --overview   # just export a stit
    Drag inside the box to move it. Add as many as you like; select one and press Delete to remove it.
 6. Click *Export ROIs* → files appear in `exports/` (button *Open export folder*).
    Exports use exactly the colors/contrast you see. Untick channels you don't want in the composite.
+
+**Comparing samples at the same contrast.** In *Compare samples*:
+- *Open another acquisition (same colors & contrast)* opens a second folder in a new window with
+  this window's per-channel colormap, contrast limits, gamma, opacity and visibility (channels are
+  matched by name), and arranges the windows side by side. On a laptop screen each window's panel
+  moves into a tab next to *layer controls* so both fit.
+- *Copy colors & contrast to other windows* pushes the current settings once; tick *Link* to have
+  every change in this window update the others live.
+- If the two acquisitions were imaged with different exposure time, laser intensity or gain
+  (read from `acquisition_channels.yaml`), you get a warning: the same contrast does not make
+  brightness comparable in that case.
 
 **Saved settings.** When you close the window (and after every export), the viewer saves the
 per-channel contrast/gamma/colormap/opacity/visibility, MIP on/off, z-plane, orientation, view

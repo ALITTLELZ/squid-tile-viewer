@@ -126,6 +126,24 @@ STRINGS = {
                       "下次打开同一文件夹自动恢复。",
                       "Display settings (contrast, colors, orientation, ROIs, ...) are saved automatically when "
                       "you close the window (and on every export) and restored next time you open this folder."),
+    "grp_compare": ("多样本比较", "Compare samples"),
+    "bt_open_other": ("打开另一个采集（沿用当前颜色和对比度）", "Open another acquisition (same colors & contrast)"),
+    "bt_sync": ("把当前颜色和对比度同步到其他窗口", "Copy colors & contrast to other windows"),
+    "cb_link": ("联动：调整时自动同步到其他窗口", "Link: changes here update other windows live"),
+    "bt_tile": ("并排排列所有窗口", "Arrange windows side by side"),
+    "compare_tip": ("通道按名称对应。只有成像条件（曝光、激光强度、增益）相同时，统一对比度后的亮度比较才有意义。",
+                    "Channels are matched by name. Comparing brightness at the same contrast is only meaningful "
+                    "if exposure, laser intensity and gain were the same."),
+    "pick_other": ("选择要比较的另一个采集文件夹", "Choose another acquisition folder to compare"),
+    "opening": ("正在打开 {name} …（第一次打开需要先拼接，请看终端进度）",
+                "Opening {name} … (first opening stitches the tiles; see progress in the terminal)"),
+    "n_inherited": ("已沿用「{src}」的颜色和对比度（{n} 个通道）", "Applied colors & contrast from '{src}' ({n} channels)"),
+    "n_synced": ("已同步到 {n} 个窗口", "Copied to {n} window(s)"),
+    "n_no_other": ("没有其他打开的窗口", "No other Tile Viewer windows are open"),
+    "n_no_match": ("「{dst}」里没有与当前窗口同名的通道，未同步", "'{dst}' has no channels with matching names; nothing copied"),
+    "w_imaging": ("注意：成像条件不同，亮度不能直接比较 —\n{diff}", "Warning: imaging settings differ, brightness is not directly comparable —\n{diff}"),
+    "imaging_key": ({"exposure_ms": "曝光(ms)", "intensity": "激光强度", "gain": "增益"},
+                    {"exposure_ms": "exposure (ms)", "intensity": "laser intensity", "gain": "gain"}),
     # notifications
     "n_restored": ("已恢复上次的显示设置", "Restored your last display settings for this folder"),
     "n_defaults": ("已沿用上次相同通道的颜色和对比度", "Applied your last color/contrast settings for these channels"),
@@ -143,6 +161,11 @@ LANG = "zh"
 def tr(key, **kw):
     s = STRINGS[key][0 if LANG == "zh" else 1]
     return s.format(**kw) if kw else s
+
+
+# Every open Tile Viewer window registers itself here so settings can be copied between them.
+OPEN_WINDOWS = []
+_SYNC = {"busy": False}
 
 
 def load_prefs():
@@ -262,19 +285,31 @@ class Acquisition:
             dz = float(m.group(1)) if m else 1.0
         self.dz_um = dz
 
-        colors = {}
+        colors, imaging = {}, {}
         chy = _load_yaml(self.folder / "acquisition_channels.yaml") or {}
         for ch in (chy.get("channels") or acq.get("channels") or []):
-            if isinstance(ch, dict) and ch.get("name") and ch.get("display_color"):
+            if not (isinstance(ch, dict) and ch.get("name")):
+                continue
+            if ch.get("display_color"):
                 colors[ch["name"]] = ch["display_color"]
-        self.channel_colors = []
-        for i, n in enumerate(self.channel_names):
-            c = colors.get(n)
-            if c is None:
-                for k, v in colors.items():
-                    if k in n or n in k:
-                        c = v
-            self.channel_colors.append(c or DEFAULT_COLORS[i % len(DEFAULT_COLORS)])
+            cam = ch.get("camera_settings") or {}
+            ill = ch.get("illumination_settings") or {}
+            imaging[ch["name"]] = {"exposure_ms": cam.get("exposure_time_ms"), "gain": cam.get("gain_mode"),
+                                   "intensity": ill.get("intensity")}
+
+        def lookup(d, n):
+            if n in d:
+                return d[n]
+            for k, v in d.items():
+                if k in n or n in k:
+                    return v
+            return None
+
+        self.channel_colors = [lookup(colors, n) or DEFAULT_COLORS[i % len(DEFAULT_COLORS)]
+                               for i, n in enumerate(self.channel_names)]
+        # imaging settings per channel (exposure, gain, laser intensity), used to warn when
+        # comparing acquisitions that were not imaged the same way
+        self.channel_imaging = {n: lookup(imaging, n) or {} for n in self.channel_names}
 
         self.cache_dir = self.folder / "_viewer_cache"
         self._mm = {}
@@ -680,7 +715,9 @@ def export_overview(acq, mosaic, out_path=None, max_px=4000):
 # ----------------------------------------------------------------------------
 # napari GUI
 # ----------------------------------------------------------------------------
-def run_viewer(folder: str | None):
+def run_viewer(folder: str | None, inherit: dict | None = None):
+    """Open a viewer window. inherit = dict(src=name, channels={channel name: settings}, imaging=...)
+    to apply another window's display settings to this one."""
     import napari
     import pandas as pd
     from napari.utils.colormaps import Colormap
@@ -807,6 +844,20 @@ def run_viewer(folder: str | None):
     vo.addWidget(lb_orient)
     lay_v.addWidget(go)
 
+    gc = QGroupBox(tr("grp_compare"))
+    vc = QVBoxLayout(gc)
+    bt_other = QPushButton(tr("bt_open_other"))
+    bt_sync = QPushButton(tr("bt_sync"))
+    cb_link = QCheckBox(tr("cb_link"))
+    bt_tile = QPushButton(tr("bt_tile"))
+    for wdg in (bt_other, bt_sync, cb_link, bt_tile):
+        vc.addWidget(wdg)
+    lb_cmp = QLabel(tr("compare_tip"))
+    lb_cmp.setWordWrap(True)
+    lb_cmp.setStyleSheet("color: gray")
+    vc.addWidget(lb_cmp)
+    lay_v.addWidget(gc)
+
     g2 = QGroupBox(tr("grp_export"))
     v2 = QVBoxLayout(g2)
 
@@ -882,7 +933,7 @@ def run_viewer(folder: str | None):
     hl.addWidget(cb_lang)
     lay_v.addLayout(hl)
     lay_v.addStretch(1)
-    for g in (g1, go, g2, gf):
+    for g in (g1, go, gc, g2, gf):
         g.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
     scroll = QScrollArea()
     scroll.setWidgetResizable(True)
@@ -890,7 +941,7 @@ def run_viewer(folder: str | None):
     scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
     scroll.setWidget(w)
     scroll.setMinimumWidth(w.sizeHint().width() + 20)
-    viewer.window.add_dock_widget(scroll, name="Tile Viewer", area="right")
+    tv_dock = viewer.window.add_dock_widget(scroll, name="Tile Viewer", area="right")
 
     # ---------------- logic ----------------
     def on_lang(i):
@@ -1327,26 +1378,167 @@ def run_viewer(folder: str | None):
                 pass
         show_info(tr("n_restored"))
 
+    # ---------------- compare samples: share settings between windows ----------------
+    qwin = viewer.window._qt_window
+    me = {"viewer": viewer, "qwin": qwin, "name": acq.folder.name, "imaging": acq.channel_imaging}
+
+    def current_channels():
+        return {l.name: channel_settings(l) for l in ch_layers}
+
+    def imaging_diffs(src_imaging, names):
+        keys = tr("imaging_key")
+        out = []
+        for n in names:
+            a, b = (src_imaging or {}).get(n) or {}, acq.channel_imaging.get(n) or {}
+            for k, label in keys.items():
+                if a.get(k) is not None and b.get(k) is not None and a[k] != b[k]:
+                    out.append(f"{n}: {label} {a[k]} ≠ {b[k]}")
+        return out
+
+    def apply_from(chans, src_imaging=None):
+        """Apply {channel name: settings} to this window. Returns (channels applied, imaging differences)."""
+        pairs = [(l, chans[l.name]) for l in ch_layers if l.name in chans]
+        if not pairs and len(chans) == len(ch_layers):  # names differ: fall back to channel order
+            pairs = list(zip(ch_layers, chans.values()))
+        _SYNC["busy"] = True
+        try:
+            for l, s in pairs:
+                apply_channel(l, s)
+        finally:
+            _SYNC["busy"] = False
+        return len(pairs), imaging_diffs(src_imaging, [l.name for l, _ in pairs])
+
+    me["apply"] = apply_from
+    me["channels"] = current_channels
+    OPEN_WINDOWS.append(me)
+
+    def others():
+        return [e for e in OPEN_WINDOWS if e is not me]
+
+    def push_to_others(quiet=False):
+        targets = others()
+        if not targets:
+            if not quiet:
+                show_info(tr("n_no_other"))
+            return
+        chans, done, warn = current_channels(), 0, []
+        for e in targets:
+            try:
+                n, diffs = e["apply"](chans, acq.channel_imaging)
+            except Exception as ex:  # window may be closing
+                print("Could not sync to", e.get("name"), ex)
+                continue
+            done += n > 0
+            if n == 0 and not quiet:
+                warn.append(tr("n_no_match", dst=e["name"]))
+            if diffs and not quiet:
+                warn.append(f"{e['name']}: " + tr("w_imaging", diff="\n".join(diffs)))
+        if not quiet:
+            show_info(tr("n_synced", n=done))
+            for w_ in warn:
+                show_warning(w_)
+
+    def on_layer_change(event=None):
+        if cb_link.isChecked() and not _SYNC["busy"]:
+            push_to_others(quiet=True)
+
+    for l in ch_layers:
+        for ev in ("contrast_limits", "gamma", "colormap", "opacity", "visible"):
+            getattr(l.events, ev).connect(on_layer_change)
+
+    def on_link(checked):
+        if checked:
+            push_to_others()
+
+    def compact():
+        """Make the window narrower: move the Tile Viewer panel into a tab next to 'layer controls'."""
+        from qtpy.QtWidgets import QDockWidget
+        lc = [d for d in qwin.findChildren(QDockWidget) if d.windowTitle() == "layer controls"]
+        if not lc or me.get("compact"):
+            return
+        qwin.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, tv_dock)
+        qwin.tabifyDockWidget(lc[0], tv_dock)
+        lc[0].raise_()
+        me["compact"] = True
+
+    me["compact_fn"] = compact
+
+    def arrange_windows():
+        """Tile all viewer windows side by side; on narrow screens, tab the panels so each fits."""
+        g = QApplication.primaryScreen().availableGeometry()
+        wdt = g.width() // max(len(OPEN_WINDOWS), 1)
+        for i, e in enumerate(OPEN_WINDOWS):
+            qw = e["qwin"]
+            qw.showNormal()
+            if qw.minimumSizeHint().width() > wdt:
+                e["compact_fn"]()
+                QApplication.processEvents()
+            qw.setGeometry(g.x() + i * wdt, g.y(), wdt, g.height())
+        QApplication.processEvents()
+        for e in OPEN_WINDOWS:  # re-fit each image to its (now smaller) canvas
+            e["viewer"].reset_view()
+
+    def open_other():
+        path = QFileDialog.getExistingDirectory(qwin, tr("pick_other"), str(acq.folder.parent))
+        if not path:
+            return
+        save_settings()
+        show_info(tr("opening", name=Path(path).name))
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        QApplication.processEvents()
+        try:
+            v2 = run_viewer(path, inherit=dict(src=acq.folder.name, channels=current_channels(),
+                                               imaging=acq.channel_imaging))
+        finally:
+            QApplication.restoreOverrideCursor()
+        if v2 is not None:
+            arrange_windows()
+
+    bt_other.clicked.connect(open_other)
+    bt_sync.clicked.connect(lambda: push_to_others())
+    cb_link.toggled.connect(on_link)
+    bt_tile.clicked.connect(arrange_windows)
+
     from qtpy.QtCore import QEvent, QObject
 
     class _SaveOnClose(QObject):
         def eventFilter(self, obj, ev):
             if ev.type() == QEvent.Type.Close:
                 save_settings()
+                if me in OPEN_WINDOWS:
+                    OPEN_WINDOWS.remove(me)
             return False
 
-    qwin = viewer.window._qt_window
     saver = _SaveOnClose(qwin)
     qwin.installEventFilter(saver)
 
     viewer.reset_view()
     restore_settings()
+    if inherit:
+        n, diffs = apply_from(inherit.get("channels", {}), inherit.get("imaging"))
+        if n:
+            show_info(tr("n_inherited", src=inherit.get("src", "?"), n=n))
+        else:
+            show_warning(tr("n_no_match", dst=acq.folder.name))
+        if diffs:
+            show_warning(tr("w_imaging", diff="\n".join(diffs)))
+    # Force a fresh slice. Without this, a folder opened for the first time (no saved settings,
+    # so nothing else moves the z slider) stayed on napari's empty 1x1 placeholder slice and
+    # showed a black canvas. layer.refresh() does not fix it; changing the z step does.
+    z_now = viewer.dims.current_step[0]
+    if acq.nz > 1:
+        viewer.dims.set_current_step(0, (z_now + 1) % acq.nz)
+        viewer.dims.set_current_step(0, z_now)
+    else:
+        for l in ch_layers:
+            l.refresh()
     viewer._tv = dict(acq=acq, set_mip=set_mip, export_region=export_region, on_auto=on_auto,
                       ch_layers=ch_layers, roi=roi, on_roi=on_roi, on_shot=on_shot,
                       add_fixed=add_fixed, snap_fixed=snap_fixed, sp_w=sp_w, sp_h=sp_h, cb_unit=cb_unit,
                       apply_orient_op=apply_orient_op, reset_orient=reset_orient, state=state,
                       save_settings=save_settings, settings_file=settings_file, saver=saver,
-                      plane=plane, cur_hw=cur_hw)
+                      plane=plane, cur_hw=cur_hw, me=me, push_to_others=push_to_others, cb_link=cb_link,
+                      arrange_windows=arrange_windows, apply_from=apply_from, current_channels=current_channels)
     return viewer
 
 
