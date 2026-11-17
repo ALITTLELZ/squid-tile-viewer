@@ -126,6 +126,15 @@ STRINGS = {
                   "在图像上点选一个框后按 delete 键删除这个框。",
                   "Drag inside the box to move it. Its size is locked: accidental resizing snaps back. "
                   "Click a box on the image, then press delete to remove that box."),
+    "name_label": ("导出文件名", "Export file name"),
+    "bt_name_default": ("默认", "Default"),
+    "name_tip": ("默认：文件夹名_通道_时间（两个及以上通道为 merge，单通道用波长，如 561nm）。可直接修改；"
+                 "多个选区自动加 _ROI1、_ROI2；同名文件不会被覆盖（自动加 _2）。对比度等参数写在图片说明里，"
+                 "并记录在 exports/export_log.csv。",
+                 "Default: folder_channels_time (\"merge\" for two or more channels, the wavelength such as 561nm "
+                 "for one). Edit it freely; several ROIs get _ROI1, _ROI2; existing files are never overwritten "
+                 "(_2 is added). Contrast and other settings are written into the image description and "
+                 "logged in exports/export_log.csv."),
     "cb_bar": ("叠加图加比例尺", "Add scale bar to composite"),
     "bar_len": ("比例尺长度 µm（0=自动）", "Scale bar length µm (0 = auto)"),
     "cb_tif": ("同时保存 16-bit TIFF（Fiji 可直接打开，带颜色）", "Also save 16-bit TIFF (opens in Fiji as colored composite)"),
@@ -1057,18 +1066,79 @@ def add_scale_bar(rgb, px_um, bar_um=None):
     return np.asarray(im)
 
 
-def save_imagej(path, zcyx, px_um, dz_um, colors_rgb, ranges, names):
+def save_imagej(path, zcyx, px_um, dz_um, colors_rgb, ranges, names, info=None):
+    """16-bit ImageJ hyperstack with channel colours and display ranges.
+    `info` (text) is shown in Fiji under Image > Show Info."""
     luts = []
     for c in colors_rgb:
         ramp = np.linspace(0, 1, 256)[:, None] * np.asarray(c)[None, :]
         luts.append((np.clip(ramp, 0, 1) * 255).astype(np.uint8).T.copy())
-    tifffile.imwrite(
-        path, np.ascontiguousarray(zcyx), imagej=True,
-        resolution=(1 / px_um, 1 / px_um),
-        metadata={"axes": "ZCYX", "mode": "composite", "unit": "um", "spacing": dz_um,
-                  "LUTs": luts, "Ranges": tuple(v for r in ranges for v in r),
-                  "Labels": [n for _ in range(zcyx.shape[0]) for n in names]},
-    )
+    md = {"axes": "ZCYX", "mode": "composite", "unit": "um", "spacing": dz_um,
+          "LUTs": luts, "Ranges": tuple(v for r in ranges for v in r),
+          "Labels": [n for _ in range(zcyx.shape[0]) for n in names]}
+    if info:
+        md["Info"] = info
+    tifffile.imwrite(path, np.ascontiguousarray(zcyx), imagej=True, resolution=(1 / px_um, 1 / px_um), metadata=md)
+
+
+# ----------------------------------------------------------------------------
+# Export naming and descriptions
+# ----------------------------------------------------------------------------
+def channel_tag(names):
+    """'merge' for two or more channels, the wavelength (e.g. '561nm') for a single channel."""
+    if len(names) >= 2:
+        return "merge"
+    if not names:
+        return "none"
+    m = re.search(r"(\d{3,4})\s*nm", names[0])
+    return f"{m.group(1)}nm" if m else safe_name(names[0])
+
+
+def safe_name(s):
+    """Make text usable as a file name on macOS and Windows."""
+    s = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", str(s)).strip().strip(".")
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s[:180] or "export"
+
+
+def unique_base(folder: Path, base: str, exts=(".png", ".tif")):
+    """base, or base_2, base_3 ... so that no existing file is overwritten."""
+    cand, k = base, 2
+    while any((folder / f"{cand}{e}").exists() for e in exts):
+        cand, k = f"{base}_{k}", k + 1
+    return cand
+
+
+def save_png(path, rgb_or_image, info_text, info_json):
+    """PNG with the export description embedded (Description/Comment/Title text chunks)."""
+    from PIL import Image
+    from PIL.PngImagePlugin import PngInfo
+    im = rgb_or_image if isinstance(rgb_or_image, Image.Image) else Image.fromarray(rgb_or_image)
+    meta = PngInfo()
+    meta.add_itxt("Title", Path(path).stem)
+    meta.add_itxt("Description", info_text)
+    meta.add_itxt("Comment", info_text)
+    meta.add_itxt("Software", "Tile Viewer")
+    meta.add_itxt("TileViewer", json.dumps(info_json, ensure_ascii=False,
+                                           default=lambda o: o.item() if hasattr(o, "item") else str(o)))
+    im.save(path, pnginfo=meta)
+
+
+LOG_COLUMNS = ["file", "exported", "acquisition", "image", "view", "orientation",
+               "x_px", "y_px", "width_px", "height_px", "width_um", "height_um", "pixel_um",
+               "scale_bar_um", "channels_shown", "contrast", "gamma", "colors", "imaging", "correction"]
+
+
+def append_export_log(folder: Path, row: dict):
+    """One row per exported image in exports/export_log.csv (opens in Excel)."""
+    p = folder / "export_log.csv"
+    new = not p.exists()
+    with open(p, "a", newline="", encoding="utf-8-sig" if new else "utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=LOG_COLUMNS, extrasaction="ignore")
+        if new:
+            w.writeheader()
+        w.writerow(row)
 
 
 def export_overview(acq, mosaic, out_path=None, max_px=4000):
@@ -1105,7 +1175,7 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
     from qtpy.QtCore import Qt, QUrl
     from qtpy.QtGui import QDesktopServices
     from qtpy.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame,
-                                QGroupBox, QHBoxLayout, QLabel, QMessageBox, QPushButton, QScrollArea,
+                                QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea,
                                 QSizePolicy, QSpinBox, QVBoxLayout, QWidget)
 
     prefs = load_prefs()
@@ -1303,6 +1373,18 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
 
     g2 = QGroupBox(tr("grp_export"))
     v2 = QVBoxLayout(g2)
+
+    v2.addWidget(QLabel(tr("name_label")))
+    hn = QHBoxLayout()
+    le_name = QLineEdit()
+    bt_name_default = QPushButton(tr("bt_name_default"))
+    hn.addWidget(le_name, 1)
+    hn.addWidget(bt_name_default)
+    v2.addLayout(hn)
+    lb_name = QLabel(tr("name_tip"))
+    lb_name.setWordWrap(True)
+    lb_name.setStyleSheet("color: gray")
+    v2.addWidget(lb_name)
 
     gf = QGroupBox(tr("grp_fixed"))
     vf = QVBoxLayout(gf)
@@ -1560,16 +1642,104 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
 
     roi.events.data.connect(snap_fixed)
 
-    def tag():
-        z = "MIP" if state["mip"] else f"z{viewer.dims.current_step[0]:02d}"
-        rot_tag = {1: "rot90ccw", 2: "rot180", 3: "rot90cw"}
-        parts = (["flipH"] if state["flip"] else []) + ([rot_tag[state["k"]]] if state["k"] else [])
-        if parts:
-            z += "_" + "-".join(parts)
-        return z, _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    # ---------------- export naming and descriptions ----------------
+    name_state = {"custom": False}
 
-    def export_region(y0, y1, x0, x1, name):
-        from PIL import Image
+    def shown_channels():
+        return [l for l in ch_layers if l.visible]
+
+    def default_base():
+        return safe_name(f"{acq.folder.name}_{channel_tag([l.name for l in shown_channels()])}_"
+                         f"{_dt.datetime.now().strftime('%Y%m%d-%H%M%S')}")
+
+    def refresh_name(*_):
+        if not name_state["custom"]:
+            le_name.setText(default_base())
+
+    def on_name_edited(text):
+        name_state["custom"] = bool(text.strip())
+
+    def on_name_default():
+        name_state["custom"] = False
+        refresh_name()
+
+    le_name.textEdited.connect(on_name_edited)
+    bt_name_default.clicked.connect(on_name_default)
+    for l in ch_layers:
+        l.events.visible.connect(refresh_name)
+    refresh_name()
+
+    def current_base():
+        """The export name: what the user typed, or the default with the current time."""
+        return safe_name(le_name.text()) if name_state["custom"] else default_base()
+
+    def orientation_text():
+        parts = (["flipped horizontally"] if state["flip"] else []) + (
+            [{1: "rotated 90° counter-clockwise", 2: "rotated 180°", 3: "rotated 90° clockwise"}[state["k"]]]
+            if state["k"] else [])
+        return " + ".join(parts) if parts else "original"
+
+    def view_text():
+        if state["mip"]:
+            return f"max projection of all {acq.nz} z-planes"
+        z = viewer.dims.current_step[0]
+        return f"z-plane {z + 1}/{acq.nz} (z = {z * acq.dz_um:g} µm from the first plane)"
+
+    def describe(kind, region=None, bar_um=None):
+        """Human-readable text + dict + log row describing an export."""
+        now = _dt.datetime.now().isoformat(sep=" ", timespec="seconds")
+        qc_ch = {c["name"]: c for c in (meta.get("qc") or {}).get("channels", [])}
+        lines = ["Tile Viewer export", f"Acquisition: {acq.folder.name}", f"Exported: {now}",
+                 f"Image: {kind}", f"View: {view_text()}", f"Orientation: {orientation_text()}"]
+        row = dict(exported=now, acquisition=acq.folder.name, image=kind, view=view_text(),
+                   orientation=orientation_text(), pixel_um=acq.px_um)
+        if region:
+            region = tuple(int(v) for v in region)
+            y0, y1, x0, x1 = region
+            wpx, hpx = x1 - x0, y1 - y0
+            lines.append(f"Region (displayed orientation): x {x0}–{x1}, y {y0}–{y1} px; "
+                         f"{wpx} × {hpx} px = {wpx * acq.px_um:.1f} × {hpx * acq.px_um:.1f} µm")
+            row.update(x_px=x0, y_px=y0, width_px=wpx, height_px=hpx,
+                       width_um=round(wpx * acq.px_um, 2), height_um=round(hpx * acq.px_um, 2))
+        lines.append(f"Pixel size: {acq.px_um:g} µm" + (f"; scale bar: {bar_um:g} µm" if bar_um else "; no scale bar"))
+        row["scale_bar_um"] = bar_um or ""
+        lines.append("Channels:")
+        chans, shown, contrast, gammas, colors, imaging = [], [], [], [], [], []
+        for l in ch_layers:
+            col = "#%02X%02X%02X" % tuple(int(round(v * 255)) for v in l.colormap.map(np.array([1.0]))[0, :3])
+            lo, hi = (float(v) for v in l.contrast_limits)
+            im = acq.channel_imaging.get(l.name) or {}
+            im_txt = ", ".join(f"{k} {im[k]:g}" for k in ("exposure_ms", "intensity", "gain")
+                               if isinstance(im.get(k), (int, float)))
+            tag = channel_tag([l.name])
+            if l.visible:
+                lines.append(f"  {l.name}: shown, colour {col}, contrast {lo:.0f}–{hi:.0f}, gamma {l.gamma:.2f}, "
+                             f"opacity {l.opacity:.2f}" + (f"; imaging: {im_txt}" if im_txt else ""))
+                shown.append(tag)
+                contrast.append(f"{tag} {lo:.0f}-{hi:.0f}")
+                gammas.append(f"{tag} {l.gamma:.2f}")
+                colors.append(f"{tag} {col}")
+            else:
+                lines.append(f"  {l.name}: hidden (not in the composite)")
+            if im_txt:
+                imaging.append(f"{tag}: {im_txt}")
+            chans.append(dict(name=l.name, shown=bool(l.visible), color=col, contrast=[lo, hi],
+                              gamma=float(l.gamma), opacity=float(l.opacity), imaging=im))
+        methods = [f"{n.split(' ')[1] if len(n.split(' ')) > 1 else n}: {c.get('method')}"
+                   for n, c in qc_ch.items() if c.get("method")]
+        corr = ("flat-field corrected" + (f" ({'; '.join(methods)})" if methods else "")
+                if meta.get("flatfield", True) else "no flat-field correction")
+        corr += f"; stitched from {len(acq.tiles)} tiles"
+        lines.append(f"Correction: {corr}")
+        lines.append("Note: PNG brightness follows these display settings; the 16-bit TIFF keeps the data values.")
+        row.update(channels_shown=" + ".join(shown), contrast="; ".join(contrast), gamma="; ".join(gammas),
+                   colors="; ".join(colors), imaging="; ".join(imaging), correction=corr)
+        info = dict(acquisition=acq.folder.name, exported=now, image=kind, view=view_text(),
+                    orientation=orientation_text(), region=dict(zip(("y0", "y1", "x0", "x1"), region)) if region else None,
+                    pixel_um=acq.px_um, scale_bar_um=bar_um, channels=chans, correction=corr)
+        return "\n".join(lines), info, row
+
+    def export_region(y0, y1, x0, x1, base, kind):
         out_dir.mkdir(exist_ok=True)
         H, W = cur_hw()
         y0, x0 = max(0, y0), max(0, x0)
@@ -1579,12 +1749,20 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
             return []
         chans = [plane(c, y0, y1, x0, x1) for c in range(acq.nc)]
         rgb = composite_rgb(chans, visible_settings())
+        bar_um = None
         if cb_bar.isChecked():
-            rgb = add_scale_bar(rgb, acq.px_um, sp_bar.value() or None)
-        z, ts = tag()
-        base = out_dir / f"{name}_{z}_{ts}"
-        Image.fromarray(rgb).save(f"{base}.png")
-        files = [f"{base}.png"]
+            bar_um = sp_bar.value() or _nice_bar((x1 - x0) * acq.px_um)
+            L = bar_um / acq.px_um
+            if 4 <= L <= (x1 - x0) * 0.9:
+                rgb = add_scale_bar(rgb, acq.px_um, bar_um)
+            else:
+                bar_um = None
+        text, info, row = describe(kind, (y0, y1, x0, x1), bar_um)
+        base = unique_base(out_dir, base)
+        files = []
+        save_png(out_dir / f"{base}.png", rgb, text, info)
+        files.append(f"{base}.png")
+        append_export_log(out_dir, dict(row, file=f"{base}.png"))
         if cb_tif.isChecked():
             if cb_stack.isChecked() and not state["mip"]:
                 arr = np.asarray(orient(levels[0])[:, :, y0:y1, x0:x1])
@@ -1592,8 +1770,9 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
                 arr = np.stack(chans)[None]
             cols = [l.colormap.map(np.array([1.0]))[0, :3] for l in ch_layers]
             rng = [tuple(map(float, l.contrast_limits)) for l in ch_layers]
-            save_imagej(f"{base}.tif", arr, acq.px_um, acq.dz_um, cols, rng, acq.channel_names)
+            save_imagej(out_dir / f"{base}.tif", arr, acq.px_um, acq.dz_um, cols, rng, acq.channel_names, info=text)
             files.append(f"{base}.tif")
+            append_export_log(out_dir, dict(row, file=f"{base}.tif"))
         return files
 
     def on_roi():
@@ -1601,6 +1780,8 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
             show_warning(tr("n_no_roi"))
             return
         feats = roi.features
+        base = current_base()
+        n = len(roi.data)
         files = []
         for k, s in enumerate(roi.data):
             yx = np.asarray(s)[:, -2:]
@@ -1610,29 +1791,35 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
                 r = fixed_rect(*yx.mean(0), int(fh), int(fw))
                 y0, x0 = r[0].astype(int)
                 y1, x1 = r[2].astype(int)
-                lab = str(feats["label"].iloc[k]).replace("×", "x").replace(" ", "").replace("µ", "u")
-                name = f"ROI{k + 1}_{lab}"
+                kind = f"ROI {k + 1} of {n}, fixed size {feats['label'].iloc[k]}"
             else:
                 y0, x0 = np.floor(yx.min(0)).astype(int)
                 y1, x1 = np.ceil(yx.max(0)).astype(int)
-                name = f"ROI{k + 1}"
-            files += export_region(y0, y1, x0, x1, name)
+                kind = f"ROI {k + 1} of {n}, free rectangle"
+            files += export_region(y0, y1, x0, x1, base if n == 1 else f"{base}_ROI{k + 1}", kind)
         if files:
             show_info(tr("n_exported", n=len(files), p=out_dir))
             save_settings()
+            refresh_name()
 
     def on_all():
         H, W = cur_hw()
-        if export_region(0, H, 0, W, "full"):
+        if export_region(0, H, 0, W, current_base(), "whole mosaic"):
             show_info(tr("n_exported_all", p=out_dir))
             save_settings()
+            refresh_name()
 
     def on_shot():
+        from PIL import Image
         out_dir.mkdir(exist_ok=True)
-        z, ts = tag()
-        p = out_dir / f"screenshot_{z}_{ts}.png"
-        viewer.screenshot(str(p), canvas_only=True, flash=True, scale=2)
+        base = unique_base(out_dir, f"{current_base()}_screenshot", exts=(".png",))
+        p = out_dir / f"{base}.png"
+        img = viewer.screenshot(None, canvas_only=True, flash=True, scale=2)
+        text, info, row = describe("screenshot of the current view")
+        save_png(p, Image.fromarray(np.asarray(img)[..., :3]), text, info)
+        append_export_log(out_dir, dict(row, file=p.name))
         show_info(tr("n_shot", f=p.name))
+        refresh_name()
 
     def on_open():
         out_dir.mkdir(exist_ok=True)
@@ -2011,7 +2198,8 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
                       save_settings=save_settings, settings_file=settings_file, saver=saver,
                       plane=plane, cur_hw=cur_hw, me=me, push_to_others=push_to_others, cb_link=cb_link,
                       arrange_windows=arrange_windows, apply_from=apply_from, current_channels=current_channels,
-                      layer_list_view=layer_list_view)
+                      layer_list_view=layer_list_view, le_name=le_name, bt_name_default=bt_name_default,
+                      on_all=on_all, out_dir=out_dir)
     return viewer
 
 

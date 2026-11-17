@@ -65,6 +65,19 @@ uv run --python 3.12 tile_viewer.py ACQ_FOLDER --overview   # just export a stit
 6. Click *Export ROIs* → files appear in `exports/` (button *Open export folder*).
    Exports use exactly the colors/contrast you see. Untick channels you don't want in the composite.
 
+**File names and what is recorded with each export.**
+- The *Export file name* field shows the default `<folder>_<channels>_<YYYYMMDD-HHMMSS>`, where
+  `<channels>` is `merge` when two or more channels are shown and the wavelength (e.g. `561nm`)
+  when one is. Type any name instead; *Default* switches back. Several ROIs get `_ROI1`, `_ROI2`;
+  screenshots get `_screenshot`; an existing file is never overwritten (`_2`, `_3` … is added).
+- Every exported image carries a description: acquisition, time, single plane or max projection,
+  orientation, ROI position and size (px and µm), pixel size, scale bar, and for each channel
+  shown/hidden, colour, contrast limits, gamma, opacity and imaging settings (exposure, laser
+  intensity, gain), plus the flat-field method. Where to see it: TIFF — Fiji *Image > Show Info*;
+  PNG — stored as the PNG *Description*/*Comment* (e.g. Preview *Tools > Show Inspector*).
+- The same information is appended to `exports/export_log.csv`, one row per file, so a folder's
+  exports can be sorted and filtered in Excel when assembling figures or slides.
+
 **Comparing samples at the same contrast.** In *Compare samples*:
 - *Open another acquisition (same colors & contrast)* opens a second folder in a new window with
   this window's per-channel colormap, contrast limits, gamma, opacity and visibility (channels are
