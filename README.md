@@ -85,6 +85,49 @@ Delete the JSON file to start fresh.
 
 Language follows the system language; change it at the bottom of the panel (applies on restart).
 
+## How stitching works, and how to tell whether it worked
+The first time a folder is opened, these steps run once and are cached:
+
+1. **Registration (where each tile goes).** For every pair of neighbouring tiles, the overlapping
+   strips are compared (phase correlation on a max projection of all channels) to find the exact
+   offset. A pair counts as *matched* if the strips agree well (correlation > 0.3). Pairs that
+   don't match — usually empty glass or very weak signal — get the median offset of the matched
+   pairs (the grid is regular). All offsets are then solved together (least squares) for one
+   position per tile.
+2. **Illumination (flat-field) correction.** The microscope lights the centre of the field more
+   than its edges and corners, and not always symmetrically. The illumination profile is
+   estimated from the data itself:
+   - *shape*: the median of many tile images (each scaled to the same mean), smoothed with a 2D
+     polynomial surface; once from images fully covered by tissue, once from all images with tissue;
+   - *tilt*: the same tissue is imaged at the right edge of one tile and the left edge of the next
+     (and top/bottom), so the brightness ratio there measures left/right and top/bottom
+     asymmetry directly; a tilt is fitted to all overlaps;
+   - the variant with the best agreement in the overlaps is used (shown in the QC figure).
+   Each tile is then divided by this profile (after subtracting the camera offset).
+3. **Blending.** In overlaps, the two tiles are mixed with weights that fade towards each tile's
+   edge, so there is no hard line. The max projection is computed per tile first and then
+   blended; blending first made seams dark in low-signal data (averaging two noisy images
+   lowers their maximum). In low-signal data the maximum over z is also pushed up by noise;
+   dividing by the illumination profile would amplify that push at the dim field corners. So
+   the part of it needed to make the max projection's centre-to-corner profile match the
+   z-average's is handled like the camera offset (automatically ~0 for bright samples).
+
+**Stitching QC** (panel at the top, *Open QC figure*, *Show tile borders and numbers*):
+- *Registration*: how many neighbour pairs were matched by image content and how far the final
+  positions are from those measurements (✅ if median ≤ 3 px). Tiles without a matched neighbour
+  are orange in the QC figure and in the tile-border overlay; they are placed on the grid, which
+  is normally fine for empty areas but can't be verified.
+- *Neighbour brightness ratio* (main check of the illumination correction): the same tissue seen
+  in two neighbouring tiles should be equally bright after correction. ✅ if the median ratio is
+  within 0.95–1.05 and the spread ≤ ±5%. The uncorrected value is shown for comparison.
+- *Seam brightness*: brightness at the seams relative to right beside them, in a single plane and
+  in the max projection (1 = invisible). Tissue structure also changes across a seam, so with fewer
+  than 20 seams this is only indicative (ℹ️).
+- What correction can't fix: differences in *focus* between tiles (a slice that isn't flat puts
+  different depths in the same z-plane), photobleaching, or real differences in staining. These
+  show up as single tiles that look brighter/dimmer in one z-plane; the max projection is less
+  affected.
+
 ## Notes
 - Expected folder layout: `ome_tiff/R0_<i>.ome.tiff` (Z × C × Y × X per tile) and
   `coordinates.csv` with the stage position of tile *i* on row *i*. Folders from aborted

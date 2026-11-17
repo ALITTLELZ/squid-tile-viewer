@@ -10,6 +10,7 @@
 #     "pandas",
 #     "pyyaml",
 #     "pillow",
+#     "matplotlib",
 # ]
 # ///
 """
@@ -74,6 +75,34 @@ STRINGS = {
     "log_flat": ("  平场校正 通道{c}：边缘/中心亮度比 {a:.2f}–{b:.2f}",
                  "  Flat-field channel {c}: relative illumination {a:.2f}-{b:.2f}"),
     "log_z": ("  第 {i}/{n} 层完成", "  z-plane {i}/{n} done"),
+    "log_mip": ("  最大投影 通道 {c}/{n} 完成", "  max projection channel {c}/{n} done"),
+    "log_qc": ("  计算拼接质控指标 ...", "  computing stitching QC ..."),
+    "log_rebuild": ("检测到旧版本的拼接缓存，按改进后的照明校正重新拼接一次",
+                    "Found a cache made with the older method; re-stitching with the improved illumination correction"),
+    # QC
+    "grp_qc": ("拼接质控", "Stitching QC"),
+    "bt_qc_fig": ("查看质控图", "Open QC figure"),
+    "cb_tiles": ("显示 tile 边界和编号", "Show tile borders and numbers"),
+    "qc_reg": ("配准：{g}/{n} 对相邻 tile 按图像内容对齐，位置误差中位 {med:.1f} px（最大 {mx:.1f} px）",
+               "Registration: {g}/{n} neighbour pairs matched by image content; position error median "
+               "{med:.1f} px (max {mx:.1f} px)"),
+    "qc_reg_none": ("配准：{n} 对相邻 tile 都无法按图像内容对齐（组织太少或信号太弱），全部按网格位置放置，无法验证对齐",
+                    "Registration: none of the {n} neighbour pairs could be matched by image content (too little "
+                    "tissue or signal); all tiles placed on the grid, alignment not verifiable"),
+    "qc_fallback": ("  其中 {n}/{t} 个 tile 没有可对齐的邻居（多为空白区域），按网格位置放置",
+                    "  {n}/{t} tiles had no matchable neighbour (mostly empty areas) and were placed on the grid"),
+    "qc_agree": ("{name}：同一块组织在相邻两个 tile 里亮度比 {m:.3f}，离散 ±{s:.1f}%（未校正时 {rm:.3f}，±{rs:.1f}%）",
+                 "{name}: same tissue in neighbouring tiles, brightness ratio {m:.3f}, spread ±{s:.1f}% "
+                 "(uncorrected {rm:.3f}, ±{rs:.1f}%)"),
+    "qc_agree_na": ("{name}：重叠区组织太少，无法检验照明校正", "{name}: too little tissue in the overlaps to check the illumination correction"),
+    "qc_seam": ("{name}：接缝处亮度 / 两侧 = 单层 {z:.3f}，最大投影 {m:.3f}（{n} 条接缝）",
+                "{name}: brightness at seams / beside = single plane {z:.3f}, max projection {m:.3f} ({n} seams)"),
+    "qc_help": ("✅ 通过　⚠️ 需要留意　❌ 有问题　ℹ️ 仅供参考。照明校正看“相邻 tile 亮度比”：在 0.95–1.05 且离散不超过 ±5% 为通过。"
+                "接缝亮度在接缝少于 20 条时受组织结构影响大，只作参考。",
+                "✅ pass  ⚠️ check  ❌ problem  ℹ️ for information. Illumination correction: the neighbour brightness "
+                "ratio should be within 0.95–1.05 with spread ≤ ±5%. Seam brightness is only indicative with fewer "
+                "than 20 seams (tissue structure dominates)."),
+    "qc_missing": ("（这个缓存没有质控数据）", "(no QC data in this cache)"),
     "log_done": ("拼接完成，用时 {t:.0f} 秒；缓存在 {p}", "Stitching finished in {t:.0f} s; cache: {p}"),
     "overview_saved": ("总览图:", "Overview image:"),
     # panel
@@ -476,33 +505,166 @@ def compute_positions(acq: Acquisition, log=print):
         "pairs_good": len(good),
         "median_offset_x": med.get("x", np.zeros(2)).tolist(),
         "median_offset_y": med.get("y", np.zeros(2)).tolist(),
+        # per pair: tile a, tile b, direction, match score (0 = unreliable), measured offset (y, x)
+        "pairs": [[int(a_i), int(b_i), d, round(float(sc), 3), float(off[0]), float(off[1])]
+                  for a_i, b_i, d, off, sc in results],
     }
     return pos, info
 
 
-def estimate_flatfield(acq: Acquisition, log=print, ds=8):
-    """Estimate per-channel illumination profile from all tiles.
-    Returns (flats[C,H,W] normalized to mean 1, darks[C])."""
-    from scipy.ndimage import gaussian_filter, zoom
+def _poly_surface(f, deg=6):
+    """Smooth surface: least-squares fit of a 2D polynomial to log(f). Unlike Gaussian blurring,
+    this does not pull the steep fall-off at the field edges towards the centre value."""
+    h, w = f.shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    yn, xn = (yy / (h - 1) * 2 - 1).ravel(), (xx / (w - 1) * 2 - 1).ravel()
+    M = np.stack([yn ** i * xn ** j for i in range(deg + 1) for j in range(deg + 1 - i)], 1)
+    coef, *_ = np.linalg.lstsq(M, np.log(np.clip(f, 1e-3, None)).ravel(), rcond=None)
+    return np.exp(M @ coef).reshape(h, w)
+
+
+def _overlap_pairs(pos, th, tw):
+    """Neighbouring tile pairs (a, b, dy, dx) in full-resolution pixels."""
+    out = []
+    for a in sorted(pos):
+        for b in sorted(pos):
+            dy, dx = pos[b][0] - pos[a][0], pos[b][1] - pos[a][1]
+            if (abs(dy) < th * 0.2 and tw * 0.5 < dx < tw) or (abs(dx) < tw * 0.2 and th * 0.5 < dy < th):
+                out.append((a, b, dy, dx))
+    return out
+
+
+def estimate_flatfield(acq: Acquisition, log=print, ds=8, stats=None, pos=None):
+    """Estimate each channel's illumination profile (flat field) from the tiles themselves.
+
+    1. camera offset ("dark") = 0.5th percentile of all pixels.
+    2. Shape: median of many images (each scaled to mean 1), smoothed with a 2D polynomial
+       surface. Two versions: from images fully covered by tissue (an image that is half empty
+       glass is dark at one edge, which would look like uneven illumination), and from all
+       images with tissue.
+    3. Tilt from the overlaps (needs tile positions): the same tissue is imaged at the left edge
+       of one tile and the right edge of its neighbour (top/bottom likewise), so the brightness
+       ratio there measures the left/right and top/bottom illumination ratio directly. Each shape
+       is optionally corrected by a fitted tilt (x, y, and x*y terms).
+    4. The candidate with the best overlap agreement (smallest spread of the brightness ratio of
+       the same tissue in two tiles) is used. Its agreement is reported in the QC.
+    Returns (flats[C,H,W] normalised to mean 1, darks[C]); fills `stats` (per channel) if given."""
+    from scipy.ndimage import zoom
+    ids = list(acq.tiles)
+    pairs = _overlap_pairs(pos, acq.th, acq.tw) if pos else []
     flats, darks = [], []
     for c in range(acq.nc):
-        imgs = []
-        for i in acq.tiles:
-            a = acq.tile(i)
-            for z in range(acq.nz):
-                imgs.append(a[z, c, ::ds, ::ds].astype(np.float32))
-        imgs = np.stack(imgs)
+        stack = {i: acq.tile(i)[:, c, ::ds, ::ds].astype(np.float32) for i in ids}  # (Z, h, w) per tile
+        imgs = np.concatenate([stack[i] for i in ids])
+        n, h, w = imgs.shape
         dark = float(np.percentile(imgs, 0.5))
+        # tissue coverage: fraction of 8x8 blocks clearly above background
+        thr = dark + 0.25 * (np.percentile(imgs, 90) - dark)
+        bh, bw = h // 8, w // 8
+        blocks = imgs[:, :bh * 8, :bw * 8].reshape(n, 8, bh, 8, bw).transpose(0, 1, 3, 2, 4).reshape(n, 64, -1)
+        cov = (np.median(blocks, -1) > thr).mean(1)
+        n_full = int((cov >= 0.98).sum())
         means = imgs.mean(axis=(1, 2))
-        keep = imgs[means >= np.median(means)]  # use tissue-rich images only
-        keep = (keep - dark) / np.maximum(keep.mean(axis=(1, 2), keepdims=True) - dark, 1e-3)
-        f = np.median(keep, axis=0)
-        f = gaussian_filter(f, sigma=max(f.shape) / 12, mode="nearest")
-        f = np.clip(f / f.mean(), 0.2, 5)
+
+        def shape_from(sel):
+            k = imgs[sel]
+            k = (k - dark) / np.maximum(k.mean(axis=(1, 2), keepdims=True) - dark, 1e-3)
+            f = _poly_surface(np.median(k, axis=0))
+            return f / f.mean()
+
+        shapes = {"covered": shape_from(cov >= 0.98 if n_full >= 10 else np.argsort(cov)[-max(10, n // 10):]),
+                  "all": shape_from(means >= np.median(means))}
+
+        # overlap data (z-mean, dark subtracted) for agreement and tilt fitting
+        yy, xx = np.mgrid[0:h, 0:w]
+        yn, xn = yy / (h - 1) * 2 - 1, xx / (w - 1) * 2 - 1
+        ov = []
+        for a, b, dy, dx in pairs:
+            dy, dx = int(round(dy / ds)), int(round(dx / ds))
+            ya0, ya1, xa0, xa1 = max(0, dy), min(h, h + dy), max(0, dx), min(w, w + dx)
+            sa, sb = (slice(ya0, ya1), slice(xa0, xa1)), (slice(ya0 - dy, ya1 - dy), slice(xa0 - dx, xa1 - dx))
+            A, B = stack[a][:, sa[0], sa[1]].mean(0) - dark, stack[b][:, sb[0], sb[1]].mean(0) - dark
+            t = 0.25 * np.percentile(np.r_[A.ravel(), B.ravel()], 90)
+            m = (A > t) & (B > t)
+            if m.sum() >= 50:
+                ov.append((A[m], B[m], sa, sb, m))
+
+        def agreement(f):
+            r = np.array([np.median(B / f[sb][m]) / np.median(A / f[sa][m]) for A, B, sa, sb, m in ov])
+            return (float(np.median(r)), float(np.percentile(np.abs(np.log(r)), 75))) if len(r) else (None, None)
+
+        def with_tilt(f0, terms):
+            rows, rhs = [], []
+            for A, B, sa, sb, m in ov:
+                rhs.append(np.log(np.median(B / f0[sb][m]) / np.median(A / f0[sa][m])))
+                xa, ya, xb, yb = xn[sa][m].mean(), yn[sa][m].mean(), xn[sb][m].mean(), yn[sb][m].mean()
+                row = [xb - xa, yb - ya]
+                if terms == 3:
+                    row.append(xb * yb - xa * ya)
+                rows.append(row)
+            coef, *_ = np.linalg.lstsq(np.array(rows), np.array(rhs), rcond=None)
+            g = coef[0] * xn + coef[1] * yn + (coef[2] * xn * yn if terms == 3 else 0)
+            f = f0 * np.exp(g)
+            return f / f.mean()
+
+        cands = {}
+        for sname, f0 in shapes.items():
+            cands[sname] = f0
+            if len(ov) >= 6:
+                cands[sname + "+tilt"] = with_tilt(f0, 2)
+                cands[sname + "+tilt+diag"] = with_tilt(f0, 3)
+        scored = []
+        for name, f in cands.items():
+            if f.min() < 0.1 or f.max() > 5:
+                continue  # implausible illumination profile
+            med, spread = agreement(f)
+            scored.append((spread if spread is not None else 0.0, name, f, med))
+        if not scored:
+            scored = [(0.0, "covered", shapes["covered"], None)]
+        scored.sort(key=lambda s: s[0])
+        spread, method, f, med = scored[0]
+        raw_med, raw_spread = agreement(np.ones((h, w)))
+        f = np.clip(f, 0.05, 20)
+
+        # Max projection: the maximum over z is pushed up by noise. Dividing by the flat field
+        # would amplify that push at the dim field edges, making tile corners bright in the MIP of
+        # low-signal data. Part of the noise push (alpha * bias) is therefore treated like the camera
+        # offset (not amplified); alpha is chosen so the MIP's centre-to-corner profile matches the
+        # z-average's, which has no noise push.
+        mx = np.stack([stack[i].max(0) for i in ids])
+        mn = np.stack([stack[i].mean(0) for i in ids])
+        bg = mn < np.percentile(mn, 5)
+        bias = float(np.median((mx - mn)[bg]))
+        tile_level = np.median(mn, axis=(1, 2))
+        tissue = tile_level >= np.median(tile_level)
+        kk = max(2, h // 20)
+
+        def corner_ratio(img):
+            img = np.median(img / np.maximum(np.median(img, axis=(1, 2), keepdims=True), 1e-6), 0)
+            corners = np.mean([img[:kk, :kk].mean(), img[:kk, -kk:].mean(), img[-kk:, :kk].mean(), img[-kk:, -kk:].mean()])
+            return corners / max(img[h // 2 - kk:h // 2 + kk, w // 2 - kk:w // 2 + kk].mean(), 1e-6)
+
+        target = corner_ratio((mn[tissue] - dark) / f)
+        err = lambda a: corner_ratio((mx[tissue] - dark - a * bias) / f + a * bias) - target
+        if err(0.0) * err(1.0) > 0:
+            alpha = 0.0 if abs(err(0.0)) <= abs(err(1.0)) else 1.0
+        else:
+            lo_, hi_ = 0.0, 1.0
+            for _ in range(20):
+                m_ = (lo_ + hi_) / 2
+                lo_, hi_ = (lo_, m_) if err(lo_) * err(m_) <= 0 else (m_, hi_)
+            alpha = (lo_ + hi_) / 2
+        mip_bias = float(alpha * bias)
+        del mx, mn
         F = zoom(f, (acq.th / f.shape[0], acq.tw / f.shape[1]), order=1)[: acq.th, : acq.tw]
         flats.append(F.astype(np.float32))
         darks.append(dark)
-        log(tr("log_flat", c=c, a=f.min(), b=f.max()))
+        if stats is not None:
+            stats.append(dict(n_images=n, n_full=n_full, method=method, n_overlaps=len(ov),
+                              agree_median=med, agree_spread=spread if ov else None,
+                              raw_agree_median=raw_med, raw_agree_spread=raw_spread,
+                              mip_bias=round(mip_bias, 2), mip_noise=round(bias, 2)))
+        log(tr("log_flat", c=c, a=f.min(), b=f.max()) + (f"  [{method}]" if ov else ""))
     return np.stack(flats), darks
 
 
@@ -519,15 +681,234 @@ def _downsample2(a):
     return (a[..., 0::2, 0::2] + a[..., 1::2, 0::2] + a[..., 0::2, 1::2] + a[..., 1::2, 1::2]) / 4
 
 
+def _correct(t, c, flats, darks):
+    """Flat-field correct one tile plane (or stack) of channel c."""
+    t = t.astype(np.float32)
+    if flats is None:
+        return t
+    return (t - darks[c]) / flats[c] + darks[c]
+
+
+def fuse_mip(acq, pos, flats, darks, out, log=print, mip_bias=None):
+    """Maximum projection, computed per tile and then blended.
+    Blending first and projecting afterwards made seams dark in low-signal data: averaging two
+    noisy tiles lowers the noise, so the maximum over z is lower in the overlap than elsewhere.
+    mip_bias[c]: part of the noise push of the maximum that is not amplified by the flat field
+    (see estimate_flatfield)."""
+    H, W = out.shape[-2:]
+    fw = _feather(acq.th, acq.tw)
+    wsum = np.zeros((H, W), np.float32)
+    for i, (y, x) in pos.items():
+        wsum[y:y + acq.th, x:x + acq.tw] += fw
+    wsum[wsum == 0] = 1
+    canvas = np.zeros((H, W), np.float32)
+    for c in range(acq.nc):
+        canvas[:] = 0
+        extra = (mip_bias[c] if mip_bias else 0.0) if flats is not None else 0.0
+        for i, (y, x) in pos.items():
+            m = acq.tile(i)[:, c].max(axis=0).astype(np.float32)
+            if flats is not None:
+                base = darks[c] + extra
+                m = (m - base) / flats[c] + base
+            canvas[y:y + acq.th, x:x + acq.tw] += m * fw
+        out[c] = np.clip(canvas / wsum + 0.5, 0, 65535).astype(np.uint16)
+        log(tr("log_mip", c=c + 1, n=acq.nc))
+    out.flush()
+
+
+def _seam_profiles(acq, pos, img2d_fn, dark, max_pairs=60):
+    """Brightness across tile seams of a fused image, compared with the bands right next to the
+    overlap. img2d_fn(y0, y1, x0, x1) returns a region of the fused image.
+    Returns (median per-seam ratio, number of seams, mean profile) - ratio 1.0 = no visible seam.
+    Tissue structure varies across a seam too, so with few seams this is only indicative."""
+    th, tw = acq.th, acq.tw
+    ratios, profs = [], []
+    for a, b, dy, dx in _overlap_pairs(pos, th, tw):
+        horiz = abs(dy) < th * 0.2
+        if horiz:
+            ov = pos[a][1] + tw - pos[b][1]
+            mid = (pos[b][1] + pos[a][1] + tw) // 2
+            y0, y1 = max(pos[a][0], pos[b][0]), min(pos[a][0], pos[b][0]) + th
+            x0, x1 = mid - int(1.1 * ov), mid + int(1.1 * ov)
+            if x0 < 0:
+                continue
+            reg = img2d_fn(y0, y1, x0, x1)[::4]
+            want = x1 - x0
+        else:
+            ov = pos[a][0] + th - pos[b][0]
+            mid = (pos[b][0] + pos[a][0] + th) // 2
+            x0, x1 = max(pos[a][1], pos[b][1]), min(pos[a][1], pos[b][1]) + tw
+            y0, y1 = mid - int(1.1 * ov), mid + int(1.1 * ov)
+            if y0 < 0:
+                continue
+            reg = img2d_fn(y0, y1, x0, x1)[:, ::4].T
+            want = y1 - y0
+        if reg.shape[1] != want:
+            continue  # at the image border
+        reg = reg.astype(np.float32) - dark
+        rows = reg.mean(1)
+        keep = rows > np.percentile(rows, 50)  # lines through tissue
+        if keep.sum() < 10:
+            continue
+        p = np.median(reg[keep], axis=0)
+        L = len(p)
+        centre = p[int(L * 0.45):int(L * 0.55)].mean()
+        side = 0.5 * (p[int(L * 0.05):int(L * 0.2)].mean() + p[int(L * 0.8):int(L * 0.95)].mean())
+        if side <= 0:
+            continue
+        ratios.append(centre / side)
+        profs.append(np.interp(np.linspace(0, L - 1, 111), np.arange(L), p / side))
+        if len(ratios) >= max_pairs:
+            break
+    if not ratios:
+        return None, 0, None
+    return float(np.median(ratios)), len(ratios), np.mean(profs, 0).round(4).tolist()
+
+
+def compute_qc(acq, pos, info, flats, darks, L0, M0, log=print):
+    """Numbers that tell whether stitching and flat-field correction worked."""
+    log(tr("log_qc"))
+    pairs = info.get("pairs", [])
+    good = [p for p in pairs if p[3] > 0.3]
+    resid = [float(np.hypot(pos[p[1]][0] - pos[p[0]][0] - p[4], pos[p[1]][1] - pos[p[0]][1] - p[5])) for p in good]
+    tiles_with_good = {p[0] for p in good} | {p[1] for p in good}
+    qc = dict(
+        pairs_total=len(pairs), pairs_good=len(good),
+        resid_median=float(np.median(resid)) if resid else None,
+        resid_max=float(np.max(resid)) if resid else None,
+        tiles_total=len(pos), tiles_fallback=sorted(set(pos) - tiles_with_good),
+        channels=[],
+    )
+    zmid = acq.nz // 2
+    for c, name in enumerate(acq.channel_names):
+        d = darks[c] if darks is not None else float(np.percentile(np.asarray(M0[c, ::64, ::64]), 0.5))
+        r_mip, n_mip, p_mip = _seam_profiles(acq, pos, lambda y0, y1, x0, x1: np.asarray(M0[c, y0:y1, x0:x1]), d)
+        r_z, n_z, p_z = _seam_profiles(acq, pos, lambda y0, y1, x0, x1: np.asarray(L0[zmid, c, y0:y1, x0:x1]), d)
+        f = flats[c] if flats is not None else None
+        qc["channels"].append(dict(
+            name=name, dark=round(float(d), 1),
+            illum_min=round(float(f.min()), 3) if f is not None else None,
+            illum_max=round(float(f.max()), 3) if f is not None else None,
+            seam_mip=r_mip, seam_z=r_z, n_seams=n_z, profile_mip=p_mip, profile_z=p_z))
+    return qc
+
+
+def qc_verdict(qc):
+    """List of (status, text) lines for the panel; status True = pass, None = check,
+    False = problem, "info" = for information only."""
+    out = []
+    if qc["pairs_good"] == 0:
+        out.append((None, tr("qc_reg_none", n=qc["pairs_total"])))
+    else:
+        ok = qc["resid_median"] is not None and qc["resid_median"] <= 3 and qc["resid_max"] <= 15
+        out.append((ok, tr("qc_reg", g=qc["pairs_good"], n=qc["pairs_total"],
+                            med=qc["resid_median"], mx=qc["resid_max"])))
+        if qc["tiles_fallback"]:
+            out.append(("info", tr("qc_fallback", n=len(qc["tiles_fallback"]), t=qc["tiles_total"])))
+    for ch in qc["channels"]:
+        if ch.get("agree_spread") is not None:
+            dev, sp = abs(ch["agree_median"] - 1), ch["agree_spread"]
+            ok = True if (dev <= 0.05 and sp <= 0.05) else (None if (dev <= 0.10 and sp <= 0.10) else False)
+            out.append((ok, tr("qc_agree", name=ch["name"], m=ch["agree_median"], s=sp * 100,
+                               rm=ch["raw_agree_median"], rs=ch["raw_agree_spread"] * 100)))
+        elif ch.get("illum_min") is not None:
+            out.append(("info", tr("qc_agree_na", name=ch["name"])))
+        if ch.get("seam_z") is not None:
+            worst = max(abs(v - 1) for v in (ch["seam_z"], ch["seam_mip"]) if v is not None)
+            if ch.get("n_seams", 0) >= 20:
+                ok = True if worst <= 0.05 else (None if worst <= 0.10 else False)
+            else:
+                ok = "info"  # too few seams: tissue structure dominates the number
+            out.append((ok, tr("qc_seam", name=ch["name"], z=ch["seam_z"],
+                               m=ch["seam_mip"] if ch["seam_mip"] is not None else float("nan"), n=ch["n_seams"])))
+    return out
+
+
+def make_qc_figure(acq, meta, flats, out_path):
+    """Save a one-page QC figure: tile layout + registration, illumination maps, seam profiles."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+    qc, pos = meta["qc"], {int(k): v for k, v in meta["positions"].items()}
+    pairs = meta["info"].get("pairs", [])
+    nc = acq.nc
+    fig = plt.figure(figsize=(6 + 3.2 * nc, 9), dpi=110)
+    gs = fig.add_gridspec(2, 1 + nc, width_ratios=[2] + [1] * nc)
+    # 1) layout
+    ax = fig.add_subplot(gs[:, 0])
+    th, tw = acq.th, acq.tw
+    fallback = set(qc["tiles_fallback"])
+    for i, (y, x) in pos.items():
+        ax.add_patch(Rectangle((x, y), tw, th, fill=True, alpha=0.18,
+                               color="tab:orange" if i in fallback else "tab:green", lw=0))
+        ax.add_patch(Rectangle((x, y), tw, th, fill=False, ec="0.4", lw=0.5))
+        ax.text(x + tw / 2, y + th / 2, str(i), ha="center", va="center", fontsize=7, color="0.2")
+    for a, b, d, sc, *_ in pairs:
+        if a not in pos or b not in pos:
+            continue
+        ya, xa = pos[a][0] + th / 2, pos[a][1] + tw / 2
+        yb, xb = pos[b][0] + th / 2, pos[b][1] + tw / 2
+        ax.plot([xa, xb], [ya, yb], color="tab:green" if sc > 0.3 else "0.75", lw=2 if sc > 0.3 else 0.8)
+    H, W = meta["shape"][-2:]
+    ax.set_xlim(0, W); ax.set_ylim(H, 0); ax.set_aspect("equal"); ax.set_xticks([]); ax.set_yticks([])
+    ax.set_title("Registration: green line = matched by image content,\n"
+                 "grey = placed from the grid; orange tile = no matched neighbour", fontsize=9)
+    # 2) illumination maps and 3) seam profiles
+    for c, ch in enumerate(qc["channels"]):
+        ax1 = fig.add_subplot(gs[0, 1 + c])
+        if flats is not None:
+            im = ax1.imshow(flats[c][::8, ::8], cmap="magma", vmin=0)
+            fig.colorbar(im, ax=ax1, fraction=0.046, pad=0.04)
+        ax1.set_title(f"{ch['name']}\nillumination (corrected for)", fontsize=9)
+        ax1.set_xticks([]); ax1.set_yticks([])
+        ax2 = fig.add_subplot(gs[1, 1 + c])
+        x = np.linspace(-1.1, 1.1, 111)
+        for key, lab, col in (("profile_z", "single z plane", "tab:blue"), ("profile_mip", "max projection", "tab:red")):
+            if ch[key]:
+                ax2.plot(x, ch[key], color=col, label=f"{lab}: {ch['seam_' + key.split('_')[1]]:.3f}")
+        if ch.get("agree_median") is not None:
+            ax1.set_xlabel(f"neighbour ratio {ch['agree_median']:.3f} ± {ch['agree_spread'] * 100:.1f}%  "
+                           f"(uncorrected {ch['raw_agree_median']:.3f} ± {ch['raw_agree_spread'] * 100:.1f}%)\n"
+                           f"method: {ch.get('method', '')}", fontsize=8)
+        ax2.axhline(1, color="0.5", ls="--", lw=0.8)
+        ax2.axvspan(-0.5, 0.5, color="0.9", zorder=0)
+        ax2.set_ylim(0.6, 1.4)
+        ax2.set_xlabel("distance from seam (overlap widths)", fontsize=8)
+        ax2.set_title(f"brightness across seams, {ch.get('n_seams', 0)} seams (1 = no seam)", fontsize=9)
+        ax2.legend(fontsize=7, loc="lower right")
+    fig.suptitle(f"Stitching QC — {acq.folder.name}", fontsize=10)
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def _finish_qc(acq, cd, meta, pos, info, flats, darks, flat_stats, log):
+    L0 = np.load(cd / "L0.npy", mmap_mode="r")
+    M0 = np.load(cd / "M0.npy", mmap_mode="r")
+    qc = compute_qc(acq, pos, info, flats, darks, L0, M0, log)
+    for ch, st in zip(qc["channels"], flat_stats or []):
+        ch.update(st)
+    meta["qc"] = qc
+    try:
+        make_qc_figure(acq, meta, flats, cd / "qc_report.png")
+    except Exception as e:  # the figure is a convenience; never fail the build for it
+        log(f"QC figure failed: {e}")
+
+
 def build_mosaic(acq: Acquisition, log=print, force=False, flatfield=True):
     """Stitch and write the cache. Returns dict(levels=[ZCYX memmaps], mip=[CYX memmaps], meta)."""
     cd = acq.cache_dir
     meta_p = cd / "meta.json"
-    key = acq.key() + ("-ff" if flatfield else "-raw")
+    # "-ff2": flat field from tissue-covered images + polynomial surface, MIP per tile.
+    # Caches made with the older method ("-ff") have a different key and are rebuilt.
+    key = acq.key() + ("-ff2" if flatfield else "-raw2")
     if not force and meta_p.exists():
         meta = json.loads(meta_p.read_text())
         if meta.get("key") == key:
             return _open_cache(cd, meta)
+        if str(meta.get("key", "")).startswith(acq.key()):
+            log(tr("log_rebuild"))
 
     cd.mkdir(exist_ok=True)
     for p in cd.glob("*.npy"):
@@ -539,8 +920,8 @@ def build_mosaic(acq: Acquisition, log=print, force=False, flatfield=True):
     W = max(p[1] for p in pos.values()) + acq.tw
     log(tr("log_size", w=W, h=H, wmm=W * acq.px_um / 1000, hmm=H * acq.px_um / 1000))
 
-    if flatfield:
-        flats, darks = estimate_flatfield(acq, log)
+    flat_stats = []
+    flats, darks = estimate_flatfield(acq, log, stats=flat_stats, pos=pos) if flatfield else (None, None)
     L0 = np.lib.format.open_memmap(cd / "L0.npy", "w+", np.uint16, (acq.nz, acq.nc, H, W))
     fw = _feather(acq.th, acq.tw)
     wsum = np.zeros((H, W), np.float32)
@@ -552,18 +933,13 @@ def build_mosaic(acq: Acquisition, log=print, force=False, flatfield=True):
         for c in range(acq.nc):
             canvas[:] = 0
             for i, (y, x) in pos.items():
-                t = acq.tile(i)[z, c].astype(np.float32)
-                if flatfield:
-                    t = (t - darks[c]) / flats[c] + darks[c]
-                canvas[y:y + acq.th, x:x + acq.tw] += t * fw
+                canvas[y:y + acq.th, x:x + acq.tw] += _correct(acq.tile(i)[z, c], c, flats, darks) * fw
             L0[z, c] = np.clip(canvas / wsum + 0.5, 0, 65535).astype(np.uint16)
         log(tr("log_z", i=z + 1, n=acq.nz))
     L0.flush()
 
     M0 = np.lib.format.open_memmap(cd / "M0.npy", "w+", np.uint16, (acq.nc, H, W))
-    for c in range(acq.nc):
-        M0[c] = L0[:, c].max(axis=0)
-    M0.flush()
+    fuse_mip(acq, pos, flats, darks, M0, log, mip_bias=[s["mip_bias"] for s in flat_stats] if flat_stats else None)
 
     # resolution pyramid for smooth zooming
     nlev = 1
@@ -581,7 +957,10 @@ def build_mosaic(acq: Acquisition, log=print, force=False, flatfield=True):
         nlev += 1
 
     meta = dict(key=key, nlev=nlev, flatfield=flatfield, positions={str(k): v for k, v in pos.items()},
-                info=info, shape=[acq.nz, acq.nc, H, W], built=_dt.datetime.now().isoformat(timespec="seconds"))
+                info=info, shape=[acq.nz, acq.nc, H, W], built=_dt.datetime.now().isoformat(timespec="seconds"),
+                mip_method="per_tile")
+    del L0, M0, prevL, prevM
+    _finish_qc(acq, cd, meta, pos, info, flats, darks, flat_stats, log)
     meta_p.write_text(json.dumps(meta, indent=1))
     log(tr("log_done", t=time.time() - t0, p=cd))
     return _open_cache(cd, meta)
@@ -767,6 +1146,20 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
         lay.contrast_limits = (lo, hi)
         ch_layers.append(lay)
 
+    # tile borders (hidden by default; toggled from the QC panel)
+    meta = mosaic["meta"]
+    tile_pos = {int(k): v for k, v in meta["positions"].items()}
+    qc = meta.get("qc")
+    fallback_tiles = set((qc or {}).get("tiles_fallback", []))
+    tile_ids = sorted(tile_pos)
+    tiles_layer = viewer.add_shapes(
+        [np.zeros((4, 2))] * len(tile_ids), shape_type="rectangle", ndim=2, name=tr("cb_tiles"),
+        scale=scale[1:], face_color=[0, 0, 0, 0], edge_width=4,
+        edge_color=[[1, 0.6, 0.1, 1] if i in fallback_tiles else [0.3, 1, 0.3, 1] for i in tile_ids],
+        features=pd.DataFrame({"tile": [str(i) for i in tile_ids]}),
+        text={"string": "{tile}", "color": "white", "size": 10, "anchor": "center"}, visible=False,
+    )
+
     roi = viewer.add_shapes(
         ndim=2, name=tr("roi_layer"), scale=scale[1:], edge_color="white", face_color=[0, 0, 0, 0], edge_width=6,
         features=pd.DataFrame({"fw": pd.Series(dtype=float), "fh": pd.Series(dtype=float),
@@ -776,7 +1169,7 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
     roi.feature_defaults = {"fw": 0.0, "fh": 0.0, "label": ""}
     roi.mode = "pan_zoom"
     viewer.scale_bar.visible = True
-    for l in ch_layers + [roi]:
+    for l in ch_layers + [roi, tiles_layer]:
         try:
             l.units = ("um",) * l.ndim  # napari >= 0.6
         except Exception:
@@ -806,6 +1199,32 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
         h, w = levels[0].shape[-2:]
         return (w, h) if state["k"] % 2 else (h, w)
 
+    def orient_pts(pts):
+        """Map (y, x) points in original mosaic pixels to the displayed (flipped/rotated) frame."""
+        H, W = levels[0].shape[-2:]
+        y, x = pts[:, 0].astype(float), pts[:, 1].astype(float)
+        if state["flip"]:
+            x = W - x
+        for _ in range(state["k"]):  # each counter-clockwise quarter turn
+            y, x = W - x, y
+            H, W = W, H
+        return np.c_[y, x]
+
+    def update_tiles_layer():
+        rects = []
+        for i in tile_ids:
+            y, x = tile_pos[i]
+            r = np.array([[y, x], [y, x + acq.tw], [y + acq.th, x + acq.tw], [y + acq.th, x]], float)
+            o = orient_pts(r)
+            (y0, x0), (y1, x1) = o.min(0), o.max(0)
+            rects.append(np.array([[y0, x0], [y0, x1], [y1, x1], [y1, x0]]))
+        for i, r in enumerate(rects):
+            tiles_layer._data_view.edit(i, r)
+        tiles_layer.refresh()
+        tiles_layer.refresh_text()
+
+    update_tiles_layer()
+
     # ---------------- panel ----------------
     w = QWidget()
     lay_v = QVBoxLayout(w)
@@ -815,6 +1234,29 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
         w=levels[0].shape[-1], h=levels[0].shape[-2]))
     info.setWordWrap(True)
     lay_v.addWidget(info)
+
+    gq = QGroupBox(tr("grp_qc"))
+    vq = QVBoxLayout(gq)
+    if qc:
+        icon = {True: "✅", None: "⚠️", False: "❌", "info": "ℹ️"}
+        txt = "<br>".join(f"{icon[ok]} {line}" for ok, line in qc_verdict(qc))
+    else:
+        txt = tr("qc_missing")
+    lb_qc = QLabel(txt)
+    lb_qc.setWordWrap(True)
+    vq.addWidget(lb_qc)
+    lb_qch = QLabel(tr("qc_help"))
+    lb_qch.setWordWrap(True)
+    lb_qch.setStyleSheet("color: gray")
+    vq.addWidget(lb_qch)
+    hq = QHBoxLayout()
+    bt_qc = QPushButton(tr("bt_qc_fig"))
+    bt_qc.setEnabled((acq.cache_dir / "qc_report.png").exists())
+    cb_tiles = QCheckBox(tr("cb_tiles"))
+    hq.addWidget(bt_qc)
+    hq.addWidget(cb_tiles)
+    vq.addLayout(hq)
+    lay_v.addWidget(gq)
 
     g1 = QGroupBox(tr("grp_display"))
     v1 = QVBoxLayout(g1)
@@ -934,7 +1376,7 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
     hl.addWidget(cb_lang)
     lay_v.addLayout(hl)
     lay_v.addStretch(1)
-    for g in (g1, go, gc, g2, gf):
+    for g in (gq, g1, go, gc, g2, gf):
         g.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
     scroll = QScrollArea()
     scroll.setWidgetResizable(True)
@@ -980,6 +1422,7 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
         if shape_changes:
             for l, v in zip(ch_layers, vis):
                 l.visible = v
+        update_tiles_layer()
 
     def set_mip(on):
         if on == state["mip"]:
@@ -1521,7 +1964,10 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
     #    right-click "Delete" and Cmd+Backspace; does not affect contrast, colors or ROI editing);
     # 2) swallow delete/backspace in the layer list so nothing happens there at all.
     # (Re-inserting a deleted layer was tried and breaks its OpenGL drawing, so prevent instead.)
-    for l in list(ch_layers) + [roi]:
+    bt_qc.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(acq.cache_dir / "qc_report.png"))))
+    cb_tiles.toggled.connect(lambda on: setattr(tiles_layer, "visible", on))
+
+    for l in list(ch_layers) + [roi, tiles_layer]:
         try:
             l.locked = True
         except Exception:  # napari without layer locking
