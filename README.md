@@ -94,6 +94,9 @@ Language follows the system language; change it at the bottom of the panel (appl
   16-bit TIFF and keep identical settings across samples. Note that the stitched data is
   flat-field corrected and blended in tile overlaps, so for strict intensity measurements
   go back to the raw tiles in `ome_tiff/`.
+- The channel and ROI layers are locked against deletion (napari would otherwise delete the
+  selected layer when you press delete in the layer list). To delete an ROI box, click it on
+  the image and press delete.
 - Tested on macOS (Apple Silicon) with napari 0.10. Windows launcher not yet tested.
 
 ## License

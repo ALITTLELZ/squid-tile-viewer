@@ -93,9 +93,10 @@ STRINGS = {
     "h": ("高", "H"),
     "unit_px": ("像素", "pixels"),
     "bt_fixed": ("添加固定大小选框（放在画面中央）", "Add fixed-size box (at view center)"),
-    "fixed_tip": ("添加后直接拖动框内部即可移动；固定框的尺寸是锁定的，误拖边角也会自动恢复。选中框按 Delete 删除。",
+    "fixed_tip": ("添加后直接拖动框内部即可移动；固定框的尺寸是锁定的，误拖边角也会自动恢复。"
+                  "在图像上点选一个框后按 delete 键删除这个框。",
                   "Drag inside the box to move it. Its size is locked: accidental resizing snaps back. "
-                  "Select a box and press Delete to remove it."),
+                  "Click a box on the image, then press delete to remove that box."),
     "cb_bar": ("叠加图加比例尺", "Add scale bar to composite"),
     "bar_len": ("比例尺长度 µm（0=自动）", "Scale bar length µm (0 = auto)"),
     "cb_tif": ("同时保存 16-bit TIFF（Fiji 可直接打开，带颜色）", "Also save 16-bit TIFF (opens in Fiji as colored composite)"),
@@ -1499,11 +1500,12 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
     cb_link.toggled.connect(on_link)
     bt_tile.clicked.connect(arrange_windows)
 
-    from qtpy.QtCore import QEvent, QObject
+    from qtpy.QtCore import QEvent, QObject, QTimer
 
     class _SaveOnClose(QObject):
         def eventFilter(self, obj, ev):
             if ev.type() == QEvent.Type.Close:
+                me["closing"] = True
                 save_settings()
                 if me in OPEN_WINDOWS:
                     OPEN_WINDOWS.remove(me)
@@ -1511,6 +1513,30 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
 
     saver = _SaveOnClose(qwin)
     qwin.installEventFilter(saver)
+
+    # ---------------- protect the channel and ROI layers from deletion ----------------
+    # napari deletes the selected layer when the layer list has keyboard focus and you press
+    # delete/backspace -- easy to trigger by accident (e.g. when trying to delete an ROI box).
+    # 1) lock the layers against deletion (napari's own LayerLock: blocks the trash button,
+    #    right-click "Delete" and Cmd+Backspace; does not affect contrast, colors or ROI editing);
+    # 2) swallow delete/backspace in the layer list so nothing happens there at all.
+    # (Re-inserting a deleted layer was tried and breaks its OpenGL drawing, so prevent instead.)
+    for l in list(ch_layers) + [roi]:
+        try:
+            l.locked = True
+        except Exception:  # napari without layer locking
+            pass
+
+    class _NoDeleteKey(QObject):
+        def eventFilter(self, obj, ev):
+            if ev.type() == QEvent.Type.KeyPress and ev.key() in (Qt.Key.Key_Backspace, Qt.Key.Key_Delete):
+                return True
+            return False
+
+    layer_list_view = getattr(viewer.window._qt_viewer, "layers", None)
+    no_del = _NoDeleteKey(qwin)
+    if layer_list_view is not None:
+        layer_list_view.installEventFilter(no_del)
 
     viewer.reset_view()
     restore_settings()
@@ -1538,7 +1564,8 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
                       apply_orient_op=apply_orient_op, reset_orient=reset_orient, state=state,
                       save_settings=save_settings, settings_file=settings_file, saver=saver,
                       plane=plane, cur_hw=cur_hw, me=me, push_to_others=push_to_others, cb_link=cb_link,
-                      arrange_windows=arrange_windows, apply_from=apply_from, current_channels=current_channels)
+                      arrange_windows=arrange_windows, apply_from=apply_from, current_channels=current_channels,
+                      layer_list_view=layer_list_view)
     return viewer
 
 
