@@ -169,6 +169,16 @@ STRINGS = {
     "bt_open_other": ("打开另一个采集（沿用当前颜色和对比度）", "Open another acquisition (same colors & contrast)"),
     "bt_sync": ("把当前颜色和对比度同步到其他窗口", "Copy colors & contrast to other windows"),
     "cb_link": ("联动：调整时自动同步到其他窗口", "Link: changes here update other windows live"),
+    "cb_scale": ("按成像参数换算对比度（曝光 × 激光强度）", "Scale contrast by imaging settings (exposure × laser intensity)"),
+    "scale_tip": ("勾选后同步时，目标窗口的对比度 = 本底 + (源对比度 − 源本底) × 两次采集“曝光 × 激光强度”之比，"
+                  "让不同曝光拍的图亮度大致可比。前提是信号与曝光时间和激光强度成正比，只适合粗略比较；增益不同无法换算。",
+                  "When ticked, synced contrast = offset + (source contrast − source offset) × the ratio of "
+                  "exposure × laser intensity between the two acquisitions, so images taken with different exposures "
+                  "look roughly comparable. Assumes signal is proportional to exposure and laser intensity, so only "
+                  "for rough comparison; a different gain can't be converted."),
+    "n_scaled": ("按成像参数换算：{f}", "Scaled by imaging settings: {f}"),
+    "w_noscale": ("{name}：缺少曝光或激光强度信息，未换算", "{name}: exposure or laser intensity missing; not scaled"),
+    "w_gain": ("{name}：增益不同（{a} ≠ {b}），换算没有考虑增益", "{name}: gain differs ({a} ≠ {b}); the scaling ignores gain"),
     "bt_tile": ("并排排列所有窗口", "Arrange windows side by side"),
     "compare_tip": ("通道按名称对应。只有成像条件（曝光、激光强度、增益）相同时，统一对比度后的亮度比较才有意义。",
                     "Channels are matched by name. Comparing brightness at the same contrast is only meaningful "
@@ -1391,8 +1401,11 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
     bt_other = QPushButton(tr("bt_open_other"))
     bt_sync = QPushButton(tr("bt_sync"))
     cb_link = QCheckBox(tr("cb_link"))
+    cb_scale = QCheckBox(tr("cb_scale"))
+    cb_scale.setChecked(bool(prefs.get("scale_by_imaging", False)))
+    cb_scale.setToolTip(tr("scale_tip"))
     bt_tile = QPushButton(tr("bt_tile"))
-    for wdg in (bt_other, bt_sync, cb_link, bt_tile):
+    for wdg in (bt_other, bt_sync, cb_link, cb_scale, bt_tile):
         vc.addWidget(wdg)
     lb_cmp = QLabel(tr("compare_tip"))
     lb_cmp.setWordWrap(True)
@@ -2045,8 +2058,24 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
     qwin = viewer.window._qt_window
     me = {"viewer": viewer, "qwin": qwin, "name": acq.folder.name, "imaging": acq.channel_imaging}
 
+    my_darks = {c["name"]: c["dark"] for c in (meta.get("qc") or {}).get("channels", [])}
+
+    def dark_of(l):
+        if l.name in my_darks:
+            return float(my_darks[l.name])
+        return float(np.percentile(np.asarray(small_mip[ch_layers.index(l)]), 0.5))
+
     def current_channels():
-        return {l.name: channel_settings(l) for l in ch_layers}
+        return {l.name: dict(channel_settings(l), dark=dark_of(l)) for l in ch_layers}
+
+    def imaging_factor(a, b):
+        """(exposure x laser) of target / source, or None if either is unknown."""
+        try:
+            ea, ia, eb, ib = (float(a["exposure_ms"]), float(a["intensity"]),
+                              float(b["exposure_ms"]), float(b["intensity"]))
+        except (KeyError, TypeError, ValueError):
+            return None
+        return (eb * ib) / (ea * ia) if min(ea, ia, eb, ib) > 0 else None
 
     def imaging_diffs(src_imaging, name_pairs):
         keys = tr("imaging_key")
@@ -2058,16 +2087,36 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
                     out.append(f"{n}: {label} {a[k]} ≠ {b[k]}")
         return out
 
-    def apply_from(chans, src_imaging=None):
-        """Apply {channel name: settings} to this window. Returns (channels applied, imaging differences)."""
+    def apply_from(chans, src_imaging=None, scale=False):
+        """Apply {channel name: settings} to this window.
+        scale=True converts contrast limits by the exposure x laser-intensity ratio (above the camera offset).
+        Returns (channels applied, warnings, scaling notes)."""
         matched = match_channels(list(chans), [l.name for l in ch_layers])
+        warns, notes = [], []
         _SYNC["busy"] = True
         try:
             for j, src_n in matched:
-                apply_channel(ch_layers[j], chans[src_n])
+                l, st = ch_layers[j], dict(chans[src_n])
+                if scale:
+                    a = (src_imaging or {}).get(src_n) or {}
+                    b = acq.channel_imaging.get(l.name) or {}
+                    f = imaging_factor(a, b)
+                    if f is None:
+                        warns.append(tr("w_noscale", name=l.name))
+                    else:
+                        ds, dt = float(st.get("dark", 0.0)), dark_of(l)
+                        st["contrast_limits"] = [dt + (v - ds) * f for v in st["contrast_limits"]]
+                        if st.get("range"):
+                            st["range"] = [0.0, max(dt + (st["range"][1] - ds) * f, st["contrast_limits"][1])]
+                        notes.append(f"{channel_tag([l.name])} ×{f:.3g}")
+                        if a.get("gain") is not None and b.get("gain") is not None and a["gain"] != b["gain"]:
+                            warns.append(tr("w_gain", name=l.name, a=a["gain"], b=b["gain"]))
+                apply_channel(l, st)
         finally:
             _SYNC["busy"] = False
-        return len(matched), imaging_diffs(src_imaging, [(ch_layers[j].name, src_n) for j, src_n in matched])
+        if not scale:
+            warns += imaging_diffs(src_imaging, [(ch_layers[j].name, src_n) for j, src_n in matched])
+        return len(matched), warns, notes
 
     def slider_ranges():
         return {l.name: tuple(l.contrast_limits_range) for l in ch_layers}
@@ -2093,21 +2142,25 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
             if not quiet:
                 show_info(tr("n_no_other"))
             return
-        chans, done, warn = current_channels(), 0, []
+        chans, done, warn, info = current_channels(), 0, [], []
+        scale = cb_scale.isChecked()
         for e in targets:
             try:
-                n, diffs = e["apply"](chans, acq.channel_imaging)
-                widen_ranges(e["ranges"]())
+                n, warns, notes = e["apply"](chans, acq.channel_imaging, scale)
+                if not scale:  # scaled limits differ on purpose; keep each window's own slider range
+                    widen_ranges(e["ranges"]())
             except Exception as ex:  # window may be closing
                 print("Could not sync to", e.get("name"), ex)
                 continue
             done += n > 0
             if n == 0 and not quiet:
                 warn.append(tr("n_no_match", dst=e["name"]))
-            if diffs and not quiet:
-                warn.append(f"{e['name']}: " + tr("w_imaging", diff="\n".join(diffs)))
+            if warns and not quiet:
+                warn.append(f"{e['name']}: " + (tr("w_imaging", diff="\n".join(warns)) if not scale else "\n".join(warns)))
+            if notes and not quiet:
+                info.append(f"{e['name']}: " + tr("n_scaled", f=", ".join(notes)))
         if not quiet:
-            show_info(tr("n_synced", n=done))
+            show_info(tr("n_synced", n=done) + ("\n" + "\n".join(info) if info else ""))
             for w_ in warn:
                 show_warning(w_)
 
@@ -2121,6 +2174,13 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
 
     def on_link(checked):
         if checked:
+            push_to_others()
+
+    def on_scale(checked):
+        p = load_prefs()
+        p["scale_by_imaging"] = bool(checked)
+        save_prefs(p)
+        if cb_link.isChecked():
             push_to_others()
 
     def compact():
@@ -2161,16 +2221,18 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
         QApplication.processEvents()
         try:
             v2 = run_viewer(path, inherit=dict(src=acq.folder.name, channels=current_channels(),
-                                               imaging=acq.channel_imaging))
+                                               imaging=acq.channel_imaging, scale=cb_scale.isChecked()))
         finally:
             QApplication.restoreOverrideCursor()
         if v2 is not None:
-            widen_ranges(v2._tv["me"]["ranges"]())
+            if not cb_scale.isChecked():
+                widen_ranges(v2._tv["me"]["ranges"]())
             arrange_windows()
 
     bt_other.clicked.connect(open_other)
     bt_sync.clicked.connect(lambda: push_to_others())
     cb_link.toggled.connect(on_link)
+    cb_scale.toggled.connect(on_scale)
     bt_tile.clicked.connect(arrange_windows)
 
     from qtpy.QtCore import QEvent, QObject, QTimer
@@ -2217,13 +2279,15 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
     viewer.reset_view()
     restore_settings()
     if inherit:
-        n, diffs = apply_from(inherit.get("channels", {}), inherit.get("imaging"))
+        scale = bool(inherit.get("scale"))
+        n, warns, notes = apply_from(inherit.get("channels", {}), inherit.get("imaging"), scale)
         if n:
-            show_info(tr("n_inherited", src=inherit.get("src", "?"), n=n))
+            show_info(tr("n_inherited", src=inherit.get("src", "?"), n=n)
+                      + ("\n" + tr("n_scaled", f=", ".join(notes)) if notes else ""))
         else:
             show_warning(tr("n_no_match", dst=acq.folder.name))
-        if diffs:
-            show_warning(tr("w_imaging", diff="\n".join(diffs)))
+        if warns:
+            show_warning("\n".join(warns) if scale else tr("w_imaging", diff="\n".join(warns)))
     # Force a fresh slice. Without this, a folder opened for the first time (no saved settings,
     # so nothing else moves the z slider) stayed on napari's empty 1x1 placeholder slice and
     # showed a black canvas. layer.refresh() does not fix it; changing the z step does.
@@ -2242,6 +2306,7 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
                       plane=plane, cur_hw=cur_hw, me=me, push_to_others=push_to_others, cb_link=cb_link,
                       arrange_windows=arrange_windows, apply_from=apply_from, current_channels=current_channels,
                       layer_list_view=layer_list_view, le_name=le_name, bt_name_default=bt_name_default,
+                      cb_scale=cb_scale, dark_of=dark_of,
                       on_all=on_all, out_dir=out_dir)
     return viewer
 

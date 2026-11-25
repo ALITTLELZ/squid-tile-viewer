@@ -88,6 +88,13 @@ uv run --python 3.12 tile_viewer.py ACQ_FOLDER --overview   # just export a stit
 - If the two acquisitions were imaged with different exposure time, laser intensity or gain
   (read from `acquisition_channels.yaml`), you get a warning: the same contrast does not make
   brightness comparable in that case.
+- *Scale contrast by imaging settings (exposure × laser intensity)*: when ticked, synced limits
+  are converted instead of copied: `offset + (source limit − source offset) × (exposure × laser)
+  of target / (exposure × laser) of source`, so e.g. a 200 ms image gets 10× higher limits than a
+  20 ms one. The factors are shown after each sync and syncing back uses the inverse. It assumes
+  the signal is proportional to exposure and laser intensity, so treat it as a rough comparison;
+  a different gain is not converted (you get a warning). Channels are matched by name, then by
+  wavelength, then by order.
 
 **Saved settings.** When you close the window (and after every export), the viewer saves the
 per-channel contrast/gamma/colormap/opacity/visibility, MIP on/off, z-plane, orientation, view
