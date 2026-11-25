@@ -202,6 +202,35 @@ def tr(key, **kw):
     return s.format(**kw) if kw else s
 
 
+def _wavelength(name):
+    m = re.search(r"(\d{3,4})\s*nm", name) or re.search(r"(?<!\d)(\d{3})(?!\d)", name)
+    return m.group(1) if m else None
+
+
+def match_channels(src_names, dst_names):
+    """Pair channels of two acquisitions: same name, else same wavelength (e.g. 'DAPI 405' and
+    'Fluorescence 405 nm Ex'), else, if both have the same number of channels, by order.
+    Returns [(dst_index, src_name)]."""
+    pairs, used = {}, set()
+    for j, d in enumerate(dst_names):
+        if d in src_names:
+            pairs[j] = d
+            used.add(d)
+    for j, d in enumerate(dst_names):
+        if j in pairs or _wavelength(d) is None:
+            continue
+        cand = [s for s in src_names if s not in used and _wavelength(s) == _wavelength(d)]
+        if len(cand) == 1:
+            pairs[j] = cand[0]
+            used.add(cand[0])
+    rest_d = [j for j in range(len(dst_names)) if j not in pairs]
+    rest_s = [s for s in src_names if s not in used]
+    if rest_d and len(src_names) == len(dst_names) and len(rest_d) == len(rest_s):
+        for j, s_ in zip(rest_d, rest_s):
+            pairs[j] = s_
+    return sorted(pairs.items())
+
+
 # Every open Tile Viewer window registers itself here so settings can be copied between them.
 OPEN_WINDOWS = []
 _SYNC = {"busy": False}
@@ -1905,6 +1934,7 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
         cm = l.colormap
         return dict(contrast_limits=[float(v) for v in l.contrast_limits], gamma=float(l.gamma),
                     opacity=float(l.opacity), visible=bool(l.visible),
+                    range=[float(v) for v in l.contrast_limits_range],
                     colormap=dict(name=cm.name, colors=np.asarray(cm.colors).tolist(),
                                   controls=np.asarray(cm.controls).tolist()))
 
@@ -1943,7 +1973,9 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
             cl = s.get("contrast_limits")
             if cl:
                 lo, hi = l.contrast_limits_range
-                l.contrast_limits_range = (min(lo, cl[0]), max(hi, cl[1]))
+                rlo, rhi = s.get("range") or (lo, hi)
+                # widen the slider so the same values sit at the same place in both windows
+                l.contrast_limits_range = (min(lo, rlo, cl[0]), max(hi, rhi, cl[1]))
                 l.contrast_limits = tuple(cl)
             for k in ("gamma", "opacity", "visible"):
                 if k in s:
@@ -2016,11 +2048,11 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
     def current_channels():
         return {l.name: channel_settings(l) for l in ch_layers}
 
-    def imaging_diffs(src_imaging, names):
+    def imaging_diffs(src_imaging, name_pairs):
         keys = tr("imaging_key")
         out = []
-        for n in names:
-            a, b = (src_imaging or {}).get(n) or {}, acq.channel_imaging.get(n) or {}
+        for n, src_n in name_pairs:
+            a, b = (src_imaging or {}).get(src_n) or {}, acq.channel_imaging.get(n) or {}
             for k, label in keys.items():
                 if a.get(k) is not None and b.get(k) is not None and a[k] != b[k]:
                     out.append(f"{n}: {label} {a[k]} ≠ {b[k]}")
@@ -2028,19 +2060,28 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
 
     def apply_from(chans, src_imaging=None):
         """Apply {channel name: settings} to this window. Returns (channels applied, imaging differences)."""
-        pairs = [(l, chans[l.name]) for l in ch_layers if l.name in chans]
-        if not pairs and len(chans) == len(ch_layers):  # names differ: fall back to channel order
-            pairs = list(zip(ch_layers, chans.values()))
+        matched = match_channels(list(chans), [l.name for l in ch_layers])
         _SYNC["busy"] = True
         try:
-            for l, s in pairs:
-                apply_channel(l, s)
+            for j, src_n in matched:
+                apply_channel(ch_layers[j], chans[src_n])
         finally:
             _SYNC["busy"] = False
-        return len(pairs), imaging_diffs(src_imaging, [l.name for l, _ in pairs])
+        return len(matched), imaging_diffs(src_imaging, [(ch_layers[j].name, src_n) for j, src_n in matched])
+
+    def slider_ranges():
+        return {l.name: tuple(l.contrast_limits_range) for l in ch_layers}
+
+    def widen_ranges(ranges):
+        """Widen this window's sliders to cover another window's (so both look the same)."""
+        for j, src_n in match_channels(list(ranges), [l.name for l in ch_layers]):
+            l = ch_layers[j]
+            lo, hi = l.contrast_limits_range
+            l.contrast_limits_range = (min(lo, ranges[src_n][0]), max(hi, ranges[src_n][1]))
 
     me["apply"] = apply_from
     me["channels"] = current_channels
+    me["ranges"] = slider_ranges
     OPEN_WINDOWS.append(me)
 
     def others():
@@ -2056,6 +2097,7 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
         for e in targets:
             try:
                 n, diffs = e["apply"](chans, acq.channel_imaging)
+                widen_ranges(e["ranges"]())
             except Exception as ex:  # window may be closing
                 print("Could not sync to", e.get("name"), ex)
                 continue
@@ -2123,6 +2165,7 @@ def run_viewer(folder: str | None, inherit: dict | None = None):
         finally:
             QApplication.restoreOverrideCursor()
         if v2 is not None:
+            widen_ranges(v2._tv["me"]["ranges"]())
             arrange_windows()
 
     bt_other.clicked.connect(open_other)
